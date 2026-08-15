@@ -49,7 +49,7 @@ public:
     STDMETHODIMP QueueEvent(MediaEventType met, REFGUID guidExtendedType, HRESULT hrStatus, const PROPVARIANT* pvValue) override;
 
 private:
-    HRESULT CreateDefaultMediaType(IMFMediaType** ppMediaType);
+    HRESULT CreateMediaType(UINT32 width, UINT32 height, IMFMediaType** ppMediaType);
     void QueueBlankSample(IUnknown* pToken);
 
     Microsoft::WRL::ComPtr<IMFMediaEventQueue> _eventQueue;
