@@ -40,7 +40,14 @@ def _make_icon():
 
 
 class Bridge:
-    """Streaming core: ADB forward + MJPEG receive + NV12 -> shared memory."""
+    """Streaming core: ADB forward + MJPEG receive + NV12 -> shared memory.
+
+    Async by design: start()/stop()/restart_adb() never block the caller;
+    status transitions are pushed to the UI via the on_status callback
+    (mirroring the official release: Connecting to ADB -> Starting ADB
+    server -> Waiting for USB debug authorisation -> Device authorised ->
+    Connecting to Android stream -> Streaming).
+    """
 
     def __init__(self, width=1920, height=1080, on_status=None):
         self._width = width
@@ -52,12 +59,14 @@ class Bridge:
         self._thread = None
         self._stop = threading.Event()
         self._mutex = None
+        self.status_text = "Idle"
         self.fps = 0.0
         self._fps_frames = 0
         self._fps_t0 = time.time()
 
     # -- status helper -----------------------------------------------------
     def _status(self, text):
+        self.status_text = text
         if self._on_status:
             self._on_status(text)
 
@@ -108,6 +117,20 @@ class Bridge:
         if self._thread:
             self._thread.join(timeout=3)
             self._thread = None
+        self._status("Stopped")
+
+    def restart_adb(self):
+        """Async ADB restart: never blocks the UI."""
+        threading.Thread(target=self._restart_adb_impl, daemon=True).start()
+
+    def _restart_adb_impl(self):
+        self._status("Restarting ADB…")
+        was_running = self.running
+        if was_running:
+            self.stop()
+        self._ensure_adb()
+        if was_running:
+            self.start()
 
     def _run(self):
         try:
@@ -115,24 +138,41 @@ class Bridge:
         except Exception as exc:
             self._status(f"Error: {exc}")
 
+    def _run_adb(self, *args):
+        subprocess.run(["adb", *args], check=False, capture_output=True)
+
+    def _ensure_adb(self):
+        """kill/start adb server, wait for the phone, set up the forward."""
+        self._status("Killing ADB server…")
+        self._run_adb("kill-server")
+        self._status("Starting ADB server…")
+        self._run_adb("start-server")
+        for _ in range(30):  # wait up to 15 s for the device
+            out = subprocess.run(["adb", "devices"], check=False,
+                                 capture_output=True).stdout.decode(errors="ignore")
+            if any(line.strip().endswith("\tdevice") for line in out.splitlines()):
+                break
+            self._status("Waiting for USB debug authorisation on phone…")
+            time.sleep(0.5)
+        self._status("Device authorised")
+        self._run_adb("forward", f"tcp:{PORT}", f"tcp:{PORT}")
+
     def _open_shared_mem_and_stream(self):
         h_map, ptr = self._open_shared_mem()
         self._mutex = self._k32.OpenMutexW(0x0001, False, MUTEX_NAME)
         self._frame_index = 0
-        self._status("Shared memory connected. Starting ADB forward...")
-        subprocess.run(["adb", "forward", f"tcp:{PORT}", f"tcp:{PORT}"],
-                       check=False, capture_output=True)
+        self._status("Shared memory connected. Connecting to ADB…")
+        self._ensure_adb()
         while not self._stop.is_set():
             try:
                 self._stream_loop(h_map, ptr)
             except (ConnectionError, ConnectionRefusedError, socket.timeout, OSError) as exc:
                 if self._stop.is_set():
                     break
-                self._status(f"Stream error: {exc}. Reconnecting...")
+                self._status(f"Stream error: {exc}. Reconnecting…")
                 time.sleep(2)
         self._k32.UnmapViewOfFile(ctypes.c_void_p(ptr))
         self._k32.CloseHandle(h_map)
-        self._status("Stopped")
 
     def _stream_loop(self, h_map, ptr):
         sock = socket.create_connection(("127.0.0.1", PORT), timeout=5)
@@ -224,10 +264,14 @@ def main():
     bridge = Bridge()
 
     def update_ui():
-        status_var.set("Streaming" if bridge.running else "Idle")
+        status_var.set(bridge.status_text)
         w, h = bridge.resolution
         res_var.set(f"{w}x{h}")
         fps_var.set(f"FPS: {bridge.fps:.1f}")
+        try:
+            icon.title = f"BestCam Bridge — {bridge.status_text}"
+        except Exception:
+            pass
         root.after(500, update_ui)
 
     def start():
@@ -237,11 +281,7 @@ def main():
         bridge.stop()
 
     def restart_adb():
-        subprocess.run(["adb", "kill-server"], check=False, capture_output=True)
-        subprocess.run(["adb", "start-server"], check=False, capture_output=True)
-        if bridge.running:
-            bridge.stop()
-            bridge.start()
+        bridge.restart_adb()  # async, never freezes the UI
 
     def set_res(w, h):
         bridge.set_resolution(w, h)
