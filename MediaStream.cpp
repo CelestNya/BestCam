@@ -12,6 +12,16 @@
 VirtualCamMediaStream::VirtualCamMediaStream() : _active(false), _lastFrameIndex(0) {}
 VirtualCamMediaStream::~VirtualCamMediaStream() {}
 
+// Supported resolutions (NV12, 30fps). Clients (e.g. ExVR) negotiate one of
+// these; frame data size follows the shared-memory header written by the
+// companion script, which must match the negotiated resolution.
+static const struct ResEntry { UINT32 width, height; } kSupportedResolutions[] = {
+    {1920, 1080},
+    {1280, 720},
+    {800, 450},
+    {640, 480},
+};
+
 HRESULT VirtualCamMediaStream::RuntimeClassInitialize(VirtualCamMediaSource* pSource)
 {
     _source = pSource;
@@ -19,12 +29,22 @@ HRESULT VirtualCamMediaStream::RuntimeClassInitialize(VirtualCamMediaSource* pSo
     HRESULT hr = MFCreateEventQueue(&_eventQueue);
     if (FAILED(hr)) return hr;
 
-    Microsoft::WRL::ComPtr<IMFMediaType> mediaType;
-    hr = CreateDefaultMediaType(&mediaType);
-    if (FAILED(hr)) return hr;
+    std::vector<Microsoft::WRL::ComPtr<IMFMediaType>> types;
+    types.reserve(std::size(kSupportedResolutions));
+    for (const auto& res : kSupportedResolutions)
+    {
+        Microsoft::WRL::ComPtr<IMFMediaType> mediaType;
+        hr = CreateMediaType(res.width, res.height, &mediaType);
+        if (FAILED(hr)) return hr;
+        types.push_back(std::move(mediaType));
+    }
 
-    IMFMediaType* typeArr[] = { mediaType.Get() };
-    hr = MFCreateStreamDescriptor(0, 1, typeArr, &_streamDescriptor);
+    std::vector<IMFMediaType*> typeArr;
+    typeArr.reserve(types.size());
+    for (const auto& mt : types)
+        typeArr.push_back(mt.Get());
+
+    hr = MFCreateStreamDescriptor(0, (DWORD)typeArr.size(), typeArr.data(), &_streamDescriptor);
     if (FAILED(hr)) return hr;
 
     // Must be set to prevent MF_E_ATTRIBUTENOTFOUND
@@ -38,13 +58,11 @@ HRESULT VirtualCamMediaStream::RuntimeClassInitialize(VirtualCamMediaSource* pSo
     return S_OK;
 }
 
-HRESULT VirtualCamMediaStream::CreateDefaultMediaType(IMFMediaType** ppMediaType)
+HRESULT VirtualCamMediaStream::CreateMediaType(UINT32 width, UINT32 height, IMFMediaType** ppMediaType)
 {
-    const UINT32 WIDTH  = 1920;
-    const UINT32 HEIGHT = 1080;
-    const UINT32 STRIDE = WIDTH;
+    const UINT32 STRIDE = width;
     // NV12 format size: Y plane + (UV plane)
-    const UINT32 SAMPLE_SIZE = WIDTH * HEIGHT * 3 / 2;
+    const UINT32 SAMPLE_SIZE = width * height * 3 / 2;
 
     Microsoft::WRL::ComPtr<IMFMediaType> mediaType;
     HRESULT hr = MFCreateMediaType(&mediaType);
@@ -54,7 +72,7 @@ HRESULT VirtualCamMediaStream::CreateDefaultMediaType(IMFMediaType** ppMediaType
     if (FAILED(hr)) return hr;
     hr = mediaType->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_NV12);
     if (FAILED(hr)) return hr;
-    hr = MFSetAttributeSize(mediaType.Get(), MF_MT_FRAME_SIZE, WIDTH, HEIGHT);
+    hr = MFSetAttributeSize(mediaType.Get(), MF_MT_FRAME_SIZE, width, height);
     if (FAILED(hr)) return hr;
     hr = MFSetAttributeRatio(mediaType.Get(), MF_MT_FRAME_RATE, 30, 1);
     if (FAILED(hr)) return hr;
