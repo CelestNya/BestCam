@@ -74,6 +74,8 @@ class Bridge:
     def _open_shared_mem(self):
         h_map = None
         for _ in range(60):  # wait up to 30 s for BestCamHost / driver
+            if self._stop.is_set():
+                raise RuntimeError("stopped while waiting for shared memory")
             h_map = self._k32.OpenFileMappingW(0x0002 | 0x0004, False, SHARED_MEM_NAME)
             if h_map:
                 break
@@ -136,7 +138,8 @@ class Bridge:
         try:
             self._open_shared_mem_and_stream()
         except Exception as exc:
-            self._status(f"Error: {exc}")
+            if not self._stop.is_set():
+                self._status(f"Error: {exc}")
 
     def _run_adb(self, *args):
         # CREATE_NO_WINDOW: the packaged exe is windowed; without this flag
@@ -145,12 +148,19 @@ class Bridge:
                        creationflags=subprocess.CREATE_NO_WINDOW)
 
     def _ensure_adb(self):
-        """kill/start adb server, wait for the phone, set up the forward."""
+        """kill/start adb server, wait for the phone, set up the forward.
+        Every step honors the stop flag so Stop always wins, even mid-wait."""
         self._status("Killing ADB server…")
         self._run_adb("kill-server")
+        if self._stop.is_set():
+            return
         self._status("Starting ADB server…")
         self._run_adb("start-server")
+        if self._stop.is_set():
+            return
         for _ in range(30):  # wait up to 15 s for the device
+            if self._stop.is_set():
+                return
             out = subprocess.run(["adb", "devices"], check=False,
                                  capture_output=True,
                                  creationflags=subprocess.CREATE_NO_WINDOW
@@ -159,6 +169,8 @@ class Bridge:
                 break
             self._status("Waiting for USB debug authorisation on phone…")
             time.sleep(0.5)
+        if self._stop.is_set():
+            return
         self._status("Device authorised")
         self._run_adb("forward", f"tcp:{PORT}", f"tcp:{PORT}")
 
