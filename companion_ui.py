@@ -139,7 +139,10 @@ class Bridge:
             self._status(f"Error: {exc}")
 
     def _run_adb(self, *args):
-        subprocess.run(["adb", *args], check=False, capture_output=True)
+        # CREATE_NO_WINDOW: the packaged exe is windowed; without this flag
+        # every adb call spawns a flashing console window.
+        subprocess.run(["adb", *args], check=False, capture_output=True,
+                       creationflags=subprocess.CREATE_NO_WINDOW)
 
     def _ensure_adb(self):
         """kill/start adb server, wait for the phone, set up the forward."""
@@ -149,7 +152,9 @@ class Bridge:
         self._run_adb("start-server")
         for _ in range(30):  # wait up to 15 s for the device
             out = subprocess.run(["adb", "devices"], check=False,
-                                 capture_output=True).stdout.decode(errors="ignore")
+                                 capture_output=True,
+                                 creationflags=subprocess.CREATE_NO_WINDOW
+                                 ).stdout.decode(errors="ignore")
             if any(line.strip().endswith("\tdevice") for line in out.splitlines()):
                 break
             self._status("Waiting for USB debug authorisation on phone…")
