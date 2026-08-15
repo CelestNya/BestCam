@@ -14,6 +14,7 @@ import os
 import socket
 import struct
 import subprocess
+import sys
 import threading
 import time
 
@@ -22,11 +23,41 @@ import numpy as np
 
 SHARED_MEM_NAME = "Global\\BestCam_SharedMem"
 MUTEX_NAME = "Global\\BestCam_Mutex"
-HEADER_SIZE = 24
+HEADER_SIZE = 24      # metadata portion of the header (width..frameIndex)
+DESIRED_OFFSET = 24   # desiredWidth/desiredHeight (UINT32 x2), driver -> companion
+DATA_OFFSET = 32      # NV12 frame data starts after the full 32-byte header
 MAX_W, MAX_H = 1920, 1080
-TOTAL_SIZE = HEADER_SIZE + MAX_W * MAX_H * 3 // 2
+TOTAL_SIZE = 32 + MAX_W * MAX_H * 3 // 2
 PORT = 8080
-RESOLUTIONS = [(640, 480), (800, 450), (1280, 720), (1920, 1080)]
+RESOLUTIONS = [(640, 480), (800, 450), (800, 600), (1280, 720), (1920, 1080)]
+
+
+class _SECURITY_DESCRIPTOR(ctypes.Structure):
+    _fields_ = [
+        ("Revision", ctypes.c_ubyte), ("Sbz1", ctypes.c_ubyte),
+        ("Control", ctypes.c_ushort),
+        ("Owner", ctypes.c_void_p), ("Group", ctypes.c_void_p),
+        ("Sacl", ctypes.c_void_p), ("Dacl", ctypes.c_void_p),
+    ]
+
+
+class _SECURITY_ATTRIBUTES(ctypes.Structure):
+    _fields_ = [
+        ("nLength", ctypes.c_uint32),
+        ("lpSecurityDescriptor", ctypes.c_void_p),
+        ("bInheritHandle", ctypes.c_int32),
+    ]
+
+
+def _host_path():
+    """Locate BestCamHost.exe: next to the packaged exe, or via BESTCAM_HOST."""
+    if getattr(sys, "frozen", False):
+        base = os.path.dirname(sys.executable)
+        for cand in (os.path.join(base, "_internal", "BestCamHost.exe"),
+                     os.path.join(base, "BestCamHost.exe")):
+            if os.path.exists(cand):
+                return cand
+    return os.environ.get("BESTCAM_HOST", "BestCamHost.exe")
 
 
 def _make_icon():
@@ -55,10 +86,33 @@ class Bridge:
         self._frame_size = width * height * 3 // 2
         self._on_status = on_status
         self._k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        # Explicit signatures: without them ctypes truncates 64-bit handles
+        # and pointers to 32-bit ints on x64.
+        self._k32.CreateFileMappingW.restype = ctypes.c_void_p
+        self._k32.CreateFileMappingW.argtypes = [
+            ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_uint32, ctypes.c_uint32, ctypes.c_uint32, ctypes.c_wchar_p,
+        ]
+        self._k32.CreateMutexW.restype = ctypes.c_void_p
+        self._k32.CreateMutexW.argtypes = [
+            ctypes.c_void_p, ctypes.c_int32, ctypes.c_wchar_p,
+        ]
+        self._k32.MapViewOfFile.restype = ctypes.c_void_p
+        self._k32.MapViewOfFile.argtypes = [
+            ctypes.c_void_p, ctypes.c_uint32,
+            ctypes.c_uint32, ctypes.c_uint32, ctypes.c_size_t,
+        ]
+        self._k32.WaitForSingleObject.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+        self._k32.ReleaseMutex.argtypes = [ctypes.c_void_p]
+        self._k32.CloseHandle.argtypes = [ctypes.c_void_p]
+        self._k32.UnmapViewOfFile.argtypes = [ctypes.c_void_p]
         self._writer = None
         self._thread = None
         self._stop = threading.Event()
         self._mutex = None
+        self._last_desired = None  # last seen client-negotiated resolution
+        self._pending_desired = None  # debounce candidate + stable-since stamp
+        self._pending_since = 0.0
         self.status_text = "Idle"
         self.fps = 0.0
         self._fps_frames = 0
@@ -73,10 +127,22 @@ class Bridge:
     # -- shared memory -----------------------------------------------------
     def _open_shared_mem(self):
         h_map = None
+        sa = sd = None
         for _ in range(60):  # wait up to 30 s for BestCamHost / driver
             if self._stop.is_set():
                 raise RuntimeError("stopped while waiting for shared memory")
-            h_map = self._k32.OpenFileMappingW(0x0002 | 0x0004, False, SHARED_MEM_NAME)
+            # Create (or reuse) the mapping from the user session: a NULL DACL
+            # lets the Session 0 Frame Server open it too. Creating here keeps
+            # a single canonical object alive as long as the companion runs;
+            # the driver only ever reuses it, so the two sides can never end
+            # up on different mapping objects (which would silently split the
+            # frame stream).
+            if sa is None:
+                sa, sd = self._null_dacl_sa()
+            h_map = self._k32.CreateFileMappingW(
+                ctypes.c_void_p(0xFFFFFFFFFFFFFFFF),  # INVALID_HANDLE_VALUE
+                ctypes.byref(sa), 0x04,               # PAGE_READWRITE
+                0, TOTAL_SIZE, SHARED_MEM_NAME)
             if h_map:
                 break
             time.sleep(0.5)
@@ -85,7 +151,24 @@ class Bridge:
         ptr = self._k32.MapViewOfFile(h_map, 0x0002 | 0x0004, 0, 0, TOTAL_SIZE)
         if not ptr:
             raise RuntimeError("MapViewOfFile failed")
+        self._sd = sd  # keep the security descriptor alive for the mutex below
         return h_map, ptr
+
+    def _null_dacl_sa(self):
+        """SECURITY_ATTRIBUTES whose DACL allows everyone (incl. the Session 0
+        Frame Server) to open the mapping. Returns (sa, sd): the caller must
+        keep `sd` alive (holding the reference) for as long as `sa` is used,
+        otherwise the DACL pointer dangles and CreateFileMappingW fails."""
+        advapi = ctypes.WinDLL("advapi32", use_last_error=True)
+        sd = _SECURITY_DESCRIPTOR()
+        if not advapi.InitializeSecurityDescriptor(ctypes.byref(sd), 1):
+            return None, None
+        if not advapi.SetSecurityDescriptorDacl(ctypes.byref(sd), True, None, False):
+            return None, None
+        sa = _SECURITY_ATTRIBUTES()
+        sa.nLength = ctypes.sizeof(_SECURITY_ATTRIBUTES)
+        sa.lpSecurityDescriptor = ctypes.cast(ctypes.byref(sd), ctypes.c_void_p).value
+        return sa, sd
 
     def set_resolution(self, width, height):
         """Switch output resolution; client must re-open the camera."""
@@ -97,6 +180,42 @@ class Bridge:
         self._frame_size = width * height * 3 // 2
         if running:
             self.start()
+
+    def _check_desired(self, ptr):
+        """Auto-match the resolution the driver negotiated with the client.
+
+        Only follows when the negotiated value *changes* from what we last
+        saw (_last_desired), so a manual tray selection is never overridden
+        until the client re-negotiates a different resolution. A short
+        debounce (300 ms) absorbs the probe-vs-open fight where the driver
+        briefly publishes several resolutions while a client opens."""
+        raw = ctypes.string_at(ptr + DESIRED_OFFSET, 8)
+        w, h = struct.unpack("<II", raw)
+        if w == 0 or h == 0:
+            return
+        # sanity guard: a corrupted field must never feed resize/alloc
+        if not (320 <= w <= 4096 and 320 <= h <= 4096):
+            return
+        if (w, h) == self._last_desired:
+            return
+        now = time.monotonic()
+        if (w, h) != self._pending_desired:
+            self._pending_desired = (w, h)
+            self._pending_since = now
+            return
+        # 1.5s debounce: DSHOW opens negotiate the default 640x480 before the
+        # requested size; following those transients makes the client's graph
+        # rebuild its media type twice and then stop pulling samples (black
+        # frames). Only switch after the value has been stable for 1.5s.
+        if now - self._pending_since < 1.5:
+            return
+        self._pending_desired = None
+        self._last_desired = (w, h)
+        if (w, h) == (self._width, self._height):
+            return
+        self._width, self._height = w, h
+        self._frame_size = w * h * 3 // 2
+        self._status(f"Auto-matched client resolution: {w}x{h}")
 
     @property
     def running(self):
@@ -147,6 +266,27 @@ class Bridge:
         subprocess.run(["adb", *args], check=False, capture_output=True,
                        creationflags=subprocess.CREATE_NO_WINDOW)
 
+    def _host_running(self):
+        out = subprocess.run(["tasklist", "/FI", "IMAGENAME eq BestCamHost.exe"],
+                             check=False, capture_output=True,
+                             creationflags=subprocess.CREATE_NO_WINDOW
+                             ).stdout.decode(errors="ignore")
+        return "BestCamHost.exe" in out
+
+    def _ensure_host(self):
+        """Start BestCamHost if it isn't running (mirrors the official
+        release where the driver follows the app's lifecycle).
+        Note: the host blocks on getchar(), so it must get a console; we
+        hide it via STARTUPINFO instead of CREATE_NO_WINDOW (which would
+        make getchar() return immediately and the host exit)."""
+        if self._host_running():
+            return
+        startupinfo = subprocess.STARTUPINFO()
+        startupinfo.dwFlags = subprocess.STARTF_USESHOWWINDOW
+        startupinfo.wShowWindow = 0  # SW_HIDE
+        subprocess.Popen([_host_path()], startupinfo=startupinfo)
+        self._status("Starting camera driver…")
+
     def _ensure_adb(self):
         """kill/start adb server, wait for the phone, set up the forward.
         Every step honors the stop flag so Stop always wins, even mid-wait."""
@@ -175,8 +315,16 @@ class Bridge:
         self._run_adb("forward", f"tcp:{PORT}", f"tcp:{PORT}")
 
     def _open_shared_mem_and_stream(self):
+        self._ensure_host()
         h_map, ptr = self._open_shared_mem()
-        self._mutex = self._k32.OpenMutexW(0x0001, False, MUTEX_NAME)
+        # The mutex is created by the driver together with the mapping; when
+        # the companion created the mapping first (see _open_shared_mem) the
+        # driver only reuses it and never creates the mutex, so create it here
+        # instead of waiting for it. CreateMutexW reuses an existing one, so
+        # both orders work.
+        sa, sd = self._null_dacl_sa()
+        self._sd = sd
+        self._mutex = self._k32.CreateMutexW(ctypes.byref(sa), False, MUTEX_NAME)
         self._frame_index = 0
         self._status("Shared memory connected. Connecting to ADB…")
         self._ensure_adb()
@@ -201,6 +349,10 @@ class Bridge:
         self._status(f"Streaming {self._width}x{self._height} -> BestCam driver")
         try:
             while not self._stop.is_set():
+                # Auto-match the client's negotiated resolution (checked every
+                # frame; an 8-byte read is ~1us, and it keeps the switchover
+                # gap to a single frame instead of ~15)
+                self._check_desired(ptr)
                 if len(pending) < 4:
                     pending += self._recv_exact(sock, 4 - len(pending))
                 soi = pending.find(b"\xff\xd8")
@@ -249,9 +401,12 @@ class Bridge:
 
         if self._mutex:
             self._k32.WaitForSingleObject(self._mutex, 5)
+        # Data first, header last: the header (frameIndex) is the "data ready"
+        # signal. Writing it first would let the driver read the new frameSize
+        # against the previous frame's data -> one garbled frame per switch.
+        ctypes.memmove(ptr + DATA_OFFSET, nv12.ctypes.data, self._frame_size)
         hdr = struct.pack("<4IQ", w, h, w, self._frame_size, self._frame_index)
         ctypes.memmove(ptr, hdr, HEADER_SIZE)
-        ctypes.memmove(ptr + HEADER_SIZE, nv12.ctypes.data, self._frame_size)
         if self._mutex:
             self._k32.ReleaseMutex(self._mutex)
         self._frame_index += 1
@@ -313,6 +468,9 @@ def main():
 
     def on_quit(icon=None, item=None):
         bridge.stop()
+        subprocess.run(["taskkill", "/IM", "BestCamHost.exe", "/F"],
+                       check=False, capture_output=True,
+                       creationflags=subprocess.CREATE_NO_WINDOW)
         root.quit()
         root.destroy()
 

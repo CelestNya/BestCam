@@ -36,6 +36,10 @@ public:
     void Shutdown();
     HRESULT SetCurrentMediaTypeOnHandler();
     HRESULT FireStreamStarted(const PROPVARIANT* pvarStartPosition);
+    void SyncDesiredResolution();
+    HRESULT GetNegotiatedType(IMFMediaType** ppType);
+    HRESULT SetNegotiatedType(IMFMediaType* pType);
+    void SetStreamDescriptor(IMFStreamDescriptor* pDescriptor);
 
     // IMFMediaStream
     STDMETHODIMP GetMediaSource(IMFMediaSource** ppMediaSource) override;
@@ -59,5 +63,8 @@ private:
     std::unique_ptr<FrameServer> _frameServer;
     bool _active;
     UINT64 _lastFrameIndex;
+    UINT32 _curW = 0;  // negotiated media type size (from SyncDesiredResolution)
+    UINT32 _curH = 0;
+    DWORD _lastFrameLen = 0;  // valid bytes in _lastFrame (max-size buffer)
     std::vector<BYTE> _lastFrame; // Caches the last frame to simulate freezing on disconnect
 };

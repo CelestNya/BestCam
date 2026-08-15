@@ -17,7 +17,9 @@ inline void Log(const char* fmt, ...)
     // Log to the root of C: to ensure accessibility from Session 0 (LOCAL SERVICE)
     if (fopen_s(&f, "C:\\BestCam.log", "a") == 0)
     {
-        fprintf(f, "[%lu] %s\n", GetCurrentThreadId(), buf);
+        fprintf(f, "[%llu ms pid=%lu tid=%lu] %s\n",
+                (unsigned long long)GetTickCount64(),
+                GetCurrentProcessId(), GetCurrentThreadId(), buf);
         fclose(f);
     }
 }

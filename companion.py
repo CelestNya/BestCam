@@ -16,19 +16,24 @@ chain can run below 1080p:
     BESTCAM_ADB     (optional, path to adb.exe; defaults to "adb" on PATH)
 
 The negotiated resolution must match what the client (e.g. ExVR) requests:
-the MF source advertises 1920x1080 / 1280x720 / 800x450 / 640x480 (NV12, 30fps).
-Pick one value for BESTCAM_WIDTH/HEIGHT and request the same in the client.
+the MF source advertises 1920x1080 / 1280x720 / 800x600 / 800x450 / 640x480
+(NV12, 30fps). Since the driver publishes the client's negotiated resolution
+in the shared memory header (desiredWidth/desiredHeight), this script now
+auto-matches it: no need to pick BESTCAM_WIDTH/HEIGHT by hand, though the
+env vars still set the initial output.
 
-Shared memory layout (24-byte header + NV12 frame):
+Shared memory layout (32-byte header + NV12 frame):
   Offset  0 : UINT32 width
   Offset  4 : UINT32 height
   Offset  8 : UINT32 stride
   Offset 12 : UINT32 frameSize
   Offset 16 : UINT64 frameIndex (monotonic)
-  Offset 24 : NV12 data (Y plane + interleaved UV)
+  Offset 24 : UINT32 desiredWidth  (written by the driver)
+  Offset 28 : UINT32 desiredHeight (written by the driver; 0 = none)
+  Offset 32 : NV12 data (Y plane + interleaved UV)
 
 Usage:
-  python companion.py            # 1080p (default)
+  python companion.py            # 1080p initial output, auto-matches clients
   BESTCAM_WIDTH=1280 BESTCAM_HEIGHT=720 python companion.py
 """
 import ctypes
@@ -41,28 +46,100 @@ import time
 import cv2
 import numpy as np
 
-TARGET_W = int(os.environ.get("BESTCAM_WIDTH", "1920"))
-TARGET_H = int(os.environ.get("BESTCAM_HEIGHT", "1080"))
+target_w = int(os.environ.get("BESTCAM_WIDTH", "1920"))
+target_h = int(os.environ.get("BESTCAM_HEIGHT", "1080"))
 ADB = os.environ.get("BESTCAM_ADB", "adb")
 
 SHARED_MEM_NAME = "Global\\BestCam_SharedMem"
 MUTEX_NAME = "Global\\BestCam_Mutex"
-HEADER_SIZE = 24
+HEADER_SIZE = 24      # metadata portion of the header (width..frameIndex)
+DESIRED_OFFSET = 24   # desiredWidth/desiredHeight (UINT32 x2), driver -> companion
+DATA_OFFSET = 32      # NV12 frame data starts after the full 32-byte header
 # Map the full 1080p-size mapping created by the driver; small resolutions
 # only touch the beginning of it.
-TOTAL_SIZE = HEADER_SIZE + 1920 * 1080 * 3 // 2
-FRAME_SIZE = TARGET_W * TARGET_H * 3 // 2
+TOTAL_SIZE = 32 + 1920 * 1080 * 3 // 2
 PORT = 8080
 
-_header = struct.pack("<4IQ", TARGET_W, TARGET_H, TARGET_W, FRAME_SIZE, 0)
+
+def frame_size():
+    return target_w * target_h * 3 // 2
+
+
+_header = struct.pack("<4IQ", target_w, target_h, target_w, frame_size(), 0)
+
+
+class _SECURITY_DESCRIPTOR(ctypes.Structure):
+    _fields_ = [
+        ("Revision", ctypes.c_ubyte), ("Sbz1", ctypes.c_ubyte),
+        ("Control", ctypes.c_ushort),
+        ("Owner", ctypes.c_void_p), ("Group", ctypes.c_void_p),
+        ("Sacl", ctypes.c_void_p), ("Dacl", ctypes.c_void_p),
+    ]
+
+
+class _SECURITY_ATTRIBUTES(ctypes.Structure):
+    _fields_ = [
+        ("nLength", ctypes.c_uint32),
+        ("lpSecurityDescriptor", ctypes.c_void_p),
+        ("bInheritHandle", ctypes.c_int32),
+    ]
+
+
+def _null_dacl_sa(k32):
+    """SECURITY_ATTRIBUTES whose DACL allows everyone (incl. the Session 0
+    Frame Server) to open the mapping. Returns (sa, sd): the caller must keep
+    `sd` alive (holding the reference) for as long as `sa` is used, otherwise
+    the DACL pointer dangles and CreateFileMappingW fails."""
+    advapi = ctypes.WinDLL("advapi32", use_last_error=True)
+    sd = _SECURITY_DESCRIPTOR()
+    ok = advapi.InitializeSecurityDescriptor(ctypes.byref(sd), 1)  # SECURITY_DESCRIPTOR_REVISION
+    if not ok:
+        return None, None
+    ok = advapi.SetSecurityDescriptorDacl(ctypes.byref(sd), True, None, False)
+    if not ok:
+        return None, None
+    sa = _SECURITY_ATTRIBUTES()
+    sa.nLength = ctypes.sizeof(_SECURITY_ATTRIBUTES)
+    sa.lpSecurityDescriptor = ctypes.cast(ctypes.byref(sd), ctypes.c_void_p).value
+    return sa, sd
 
 
 class SharedMemWriter:
     def __init__(self):
         self._k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        # Explicit signatures: without them ctypes truncates 64-bit handles
+        # and pointers to 32-bit ints on x64.
+        self._k32.CreateFileMappingW.restype = ctypes.c_void_p
+        self._k32.CreateFileMappingW.argtypes = [
+            ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_uint32, ctypes.c_uint32, ctypes.c_uint32, ctypes.c_wchar_p,
+        ]
+        self._k32.CreateMutexW.restype = ctypes.c_void_p
+        self._k32.CreateMutexW.argtypes = [
+            ctypes.c_void_p, ctypes.c_int32, ctypes.c_wchar_p,
+        ]
+        self._k32.MapViewOfFile.restype = ctypes.c_void_p
+        self._k32.MapViewOfFile.argtypes = [
+            ctypes.c_void_p, ctypes.c_uint32,
+            ctypes.c_uint32, ctypes.c_uint32, ctypes.c_size_t,
+        ]
+        self._k32.WaitForSingleObject.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+        self._k32.ReleaseMutex.argtypes = [ctypes.c_void_p]
         h_map = None
+        sa = sd = None
         for attempt in range(60):  # wait up to 30 s for the host/driver
-            h_map = self._k32.OpenFileMappingW(0x0002 | 0x0004, False, SHARED_MEM_NAME)
+            # Create (or reuse) the mapping from the user session: a NULL DACL
+            # lets the Session 0 Frame Server open it too. Creating here keeps
+            # a single canonical object alive as long as the companion runs;
+            # the driver only ever reuses it, so the two sides can never end
+            # up on different mapping objects (which would silently split the
+            # frame stream).
+            if sa is None:
+                sa, sd = _null_dacl_sa(self._k32)
+            h_map = self._k32.CreateFileMappingW(
+                ctypes.c_void_p(0xFFFFFFFFFFFFFFFF),  # INVALID_HANDLE_VALUE
+                ctypes.byref(sa), 0x04,               # PAGE_READWRITE
+                0, TOTAL_SIZE, SHARED_MEM_NAME)
             if h_map:
                 break
             time.sleep(0.5)
@@ -70,20 +147,69 @@ class SharedMemWriter:
             raise RuntimeError(
                 "Shared memory not found. Is BestCamHost.exe running and the camera active?"
             )
+        self._sd = sd  # keep the security descriptor alive for the mutex below
         ptr = self._k32.MapViewOfFile(h_map, 0x0002 | 0x0004, 0, 0, TOTAL_SIZE)
         if not ptr:
             raise RuntimeError("MapViewOfFile failed")
         self._h_map = h_map
         self._ptr = ptr
-        self._mutex = self._k32.OpenMutexW(0x0001, False, MUTEX_NAME)
+        # The mutex is created by the driver together with the mapping; when
+        # the companion created the mapping first (see above) the driver only
+        # reuses it and never creates the mutex, so the companion must create
+        # it here instead of waiting for it. CreateMutexW reuses an existing
+        # one, so both orders work.
+        self._mutex = None
+        if sa is None:
+            sa, sd = _null_dacl_sa(self._k32)
+        self._mutex = self._k32.CreateMutexW(ctypes.byref(sa), False, MUTEX_NAME)
+        if not self._mutex:
+            raise RuntimeError("CreateMutexW failed")
         self._frame_index = 0
+        self._pending = None   # candidate resolution waiting out the debounce
+        self._since = 0.0
+
+    def check_desired(self):
+        """Auto-match the client's negotiated resolution published by the
+        driver. Returns True when the output resolution changed."""
+        global target_w, target_h
+        raw = ctypes.string_at(self._ptr + DESIRED_OFFSET, 8)
+        w, h = struct.unpack("<II", raw)
+        if w == 0 or h == 0:
+            return False
+        # sanity guard: a corrupted field must never feed resize/alloc
+        if not (320 <= w <= 4096 and 320 <= h <= 4096):
+            return False
+        if (w, h) == (target_w, target_h):
+            return False
+        # Debounce: while a client opens the camera, the driver can publish
+        # several different negotiated resolutions (probe vs final open) that
+        # fight over the desired field for a while. DSHOW opens negotiate the
+        # default 640x480 first, then the requested size; following those
+        # transient values makes the client's graph rebuild its media type
+        # twice, and after the second rebuild DSHOW stops pulling samples
+        # (black frames). Only switch after the value has been stable for
+        # 1.5s, which filters probe transients while still following a real
+        # resolution change (a client that switched stays on the new size).
+        if (w, h) != self._pending:
+            self._pending = (w, h)
+            self._since = time.time()
+            return False
+        if time.time() - self._since < 1.5:
+            return False
+        self._pending = None
+        target_w, target_h = w, h
+        print(f"Client requested {w}x{h}: auto-matching output resolution")
+        return True
 
     def write(self, nv12: np.ndarray):
         if self._mutex:
             self._k32.WaitForSingleObject(self._mutex, 5)
-        hdr = struct.pack("<4IQ", TARGET_W, TARGET_H, TARGET_W, FRAME_SIZE, self._frame_index)
+        # Data first, header last: the header (frameIndex) is the "data ready"
+        # signal. Writing it first would let the driver read the new frameSize
+        # against the previous frame's data -> one garbled frame per switch.
+        ctypes.memmove(self._ptr + DATA_OFFSET, nv12.ctypes.data, frame_size())
+        hdr = struct.pack("<4IQ", target_w, target_h, target_w, frame_size(), self._frame_index)
         ctypes.memmove(self._ptr, hdr, HEADER_SIZE)
-        ctypes.memmove(self._ptr + HEADER_SIZE, nv12.ctypes.data, FRAME_SIZE)
         if self._mutex:
             self._k32.ReleaseMutex(self._mutex)
         self._frame_index += 1
@@ -92,13 +218,13 @@ class SharedMemWriter:
 def bgr_to_nv12(bgr: np.ndarray) -> np.ndarray:
     """BGR -> NV12 (Y plane + interleaved UV), matching the driver's expectation."""
     yuv = cv2.cvtColor(bgr, cv2.COLOR_BGR2YUV_I420)  # shape (H*3/2, W)
-    y = yuv[:TARGET_H].ravel()
-    u = yuv[TARGET_H: TARGET_H + TARGET_H // 4].ravel()
-    v = yuv[TARGET_H + TARGET_H // 4: TARGET_H + TARGET_H // 2].ravel()
-    nv12 = np.empty(FRAME_SIZE, dtype=np.uint8)
-    nv12[:TARGET_W * TARGET_H] = y
-    nv12[TARGET_W * TARGET_H::2] = u
-    nv12[TARGET_W * TARGET_H + 1::2] = v
+    y = yuv[:target_h].ravel()
+    u = yuv[target_h: target_h + target_h // 4].ravel()
+    v = yuv[target_h + target_h // 4: target_h + target_h // 2].ravel()
+    nv12 = np.empty(frame_size(), dtype=np.uint8)
+    nv12[:target_w * target_h] = y
+    nv12[target_w * target_h::2] = u
+    nv12[target_w * target_h + 1::2] = v
     return nv12
 
 
@@ -123,7 +249,7 @@ def recv_exact(sock: socket.socket, n: int) -> bytes:
 
 
 def main():
-    print(f"BestCam companion: target {TARGET_W}x{TARGET_H}, mapping {TOTAL_SIZE} bytes")
+    print(f"BestCam companion: target {target_w}x{target_h}, mapping {TOTAL_SIZE} bytes")
 
     # ADB forward
     subprocess.run([ADB, "forward", f"tcp:{PORT}", f"tcp:{PORT}"], check=False, capture_output=True)
@@ -131,6 +257,7 @@ def main():
     writer = SharedMemWriter()
     print("Shared memory connected. Waiting for phone stream...")
 
+    frame_counter = 0
     while True:
         try:
             sock = socket.create_connection(("127.0.0.1", PORT), timeout=5)
@@ -166,11 +293,16 @@ def main():
                 jpeg = pending[soi: soi + cl]
                 pending = pending[soi + cl:]
 
+                # Auto-match the client's negotiated resolution (checked every
+                # frame; an 8-byte read is ~1us, and it keeps the switchover
+                # gap to a single frame instead of ~15)
+                writer.check_desired()
+
                 bgr = cv2.imdecode(np.frombuffer(jpeg, dtype=np.uint8), cv2.IMREAD_COLOR)
                 if bgr is None:
                     continue
-                if bgr.shape[1] != TARGET_W or bgr.shape[0] != TARGET_H:
-                    bgr = cv2.resize(bgr, (TARGET_W, TARGET_H), interpolation=cv2.INTER_AREA)
+                if bgr.shape[1] != target_w or bgr.shape[0] != target_h:
+                    bgr = cv2.resize(bgr, (target_w, target_h), interpolation=cv2.INTER_AREA)
                 writer.write(bgr_to_nv12(bgr))
         except (ConnectionError, ConnectionRefusedError, socket.timeout, OSError) as exc:
             print(f"Stream error: {exc}. Reconnecting in 2 s...")

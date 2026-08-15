@@ -97,6 +97,40 @@ STDMETHODIMP VirtualCamMediaSource::CreatePresentationDescriptor(IMFPresentation
 STDMETHODIMP VirtualCamMediaSource::Start(IMFPresentationDescriptor* pPD, const GUID* pguidTimeFormat, const PROPVARIANT* pvarStartPosition)
 {
     Log("VirtualCamMediaSource::Start called");
+
+    // Re-activation: a DSHOW client that reopens the camera while this source
+    // is still running (the DSHOW bridge caches the activate/source object
+    // across opens) fires Start again. The bridge ignores a MENewStream that
+    // carries the same stream object it already knows, so it never re-binds
+    // and never pulls samples again (black frames). Rebuild the stream so the
+    // new MENewStream references a fresh object and the bridge re-binds.
+    // The client's negotiated media type (resolution) must survive the
+    // rebuild, otherwise a client that set 720p before Start ends up with a
+    // stream that still advertises 1080p (garbled frames).
+    if (_state == MFMEDIASOURCE_RUNNING)
+    {
+        Microsoft::WRL::ComPtr<IMFMediaType> negotiated;
+        HRESULT hr = _stream->GetNegotiatedType(&negotiated);
+        Microsoft::WRL::ComPtr<IMFStreamDescriptor> descriptor;
+        hr = _stream->GetStreamDescriptor(&descriptor);
+
+        _stream->Shutdown();
+        _stream.Reset();
+        _stream = Microsoft::WRL::Make<VirtualCamMediaStream>();
+        if (!_stream) return E_OUTOFMEMORY;
+        hr = _stream->RuntimeClassInitialize(this);
+        if (FAILED(hr)) return hr;
+        // Share the old stream descriptor: the DSHOW bridge keeps a cached
+        // pointer to it and later resolution changes (client SetFormat) go
+        // through that cached object. A fresh descriptor would silently drop
+        // those calls and the client would keep the previous resolution.
+        if (descriptor)
+            _stream->SetStreamDescriptor(descriptor.Get());
+        if (negotiated)
+            _stream->SetNegotiatedType(negotiated.Get());
+        Log("VirtualCamMediaSource: stream rebuilt for re-activation");
+    }
+
     _state = MFMEDIASOURCE_RUNNING;
     _stream->SetActive(true);
 
