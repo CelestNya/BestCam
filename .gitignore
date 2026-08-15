@@ -1,0 +1,11 @@
+# Build output
+build/
+cmake-build-*/
+*.user
+
+# Python
+__pycache__/
+*.pyc
+
+# Logs
+*.log
