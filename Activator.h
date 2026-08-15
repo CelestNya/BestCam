@@ -46,17 +46,20 @@ public:
     {
         Log("VirtualCamActivator::ActivateObject called");
         if (!ppv) return E_POINTER;
-        
-        if (!_source)
-        {
-            _source = Make<VirtualCamMediaSource>();
-            if (!_source) return E_OUTOFMEMORY;
-            
-            HRESULT hr = _source->RuntimeClassInitialize();
-            if (FAILED(hr)) { 
-                _source.Reset(); 
-                return hr; 
-            }
+
+        // A fresh source per activation. DSHOW opens can create several
+        // concurrent sessions (probe + final open + graph rebuilds after a
+        // failed open); if they all shared one source instance, every session
+        // pulled from the same stream event queue and the reading session
+        // starved (black frames). Independent sources give each session its
+        // own stream, event queue and frame cache, so they never compete.
+        _source = Make<VirtualCamMediaSource>();
+        if (!_source) return E_OUTOFMEMORY;
+
+        HRESULT hr = _source->RuntimeClassInitialize();
+        if (FAILED(hr)) {
+            _source.Reset();
+            return hr;
         }
         return _source->QueryInterface(riid, ppv);
     }

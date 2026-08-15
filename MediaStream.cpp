@@ -18,9 +18,13 @@ VirtualCamMediaStream::~VirtualCamMediaStream() {}
 static const struct ResEntry { UINT32 width, height; } kSupportedResolutions[] = {
     {1920, 1080},
     {1280, 720},
+    {800, 600},
     {800, 450},
     {640, 480},
 };
+
+// Cache buffer covers the largest frame the mapping can hold.
+static const DWORD MAX_FRAME_BYTES = 1920 * 1080 * 3 / 2;
 
 HRESULT VirtualCamMediaStream::RuntimeClassInitialize(VirtualCamMediaSource* pSource)
 {
@@ -115,9 +119,60 @@ HRESULT VirtualCamMediaStream::SetCurrentMediaTypeOnHandler()
     return handler->SetCurrentMediaType(mediaType.Get());
 }
 
+HRESULT VirtualCamMediaStream::GetNegotiatedType(IMFMediaType** ppType)
+{
+    if (!ppType) return E_POINTER;
+    Microsoft::WRL::ComPtr<IMFMediaTypeHandler> handler;
+    HRESULT hr = _streamDescriptor->GetMediaTypeHandler(&handler);
+    if (FAILED(hr)) return hr;
+    return handler->GetCurrentMediaType(ppType);
+}
+
+HRESULT VirtualCamMediaStream::SetNegotiatedType(IMFMediaType* pType)
+{
+    if (!pType) return E_POINTER;
+    Microsoft::WRL::ComPtr<IMFMediaTypeHandler> handler;
+    HRESULT hr = _streamDescriptor->GetMediaTypeHandler(&handler);
+    if (FAILED(hr)) return hr;
+    return handler->SetCurrentMediaType(pType);
+}
+
+void VirtualCamMediaStream::SetStreamDescriptor(IMFStreamDescriptor* pDescriptor)
+{
+    if (pDescriptor)
+        _streamDescriptor = pDescriptor;
+}
+
 void VirtualCamMediaStream::SetActive(bool active)
 {
     _active = active;
+}
+
+// Read the currently negotiated media type and publish the resolution into
+// the shared memory header so the companion script can auto-match its
+// output. Called on every RequestSample: the negotiated type can change
+// between client open() calls (and even per-open), so the desired field
+// must reflect it promptly to shrink the mismatch window.
+void VirtualCamMediaStream::SyncDesiredResolution()
+{
+    if (!_frameServer)
+        return;
+
+    Microsoft::WRL::ComPtr<IMFMediaTypeHandler> handler;
+    if (FAILED(_streamDescriptor->GetMediaTypeHandler(&handler)))
+        return;
+
+    Microsoft::WRL::ComPtr<IMFMediaType> mediaType;
+    if (FAILED(handler->GetCurrentMediaType(&mediaType)))
+        return;
+
+    UINT32 width = 0, height = 0;
+    if (FAILED(MFGetAttributeSize(mediaType.Get(), MF_MT_FRAME_SIZE, &width, &height)))
+        return;
+
+    _curW = width;
+    _curH = height;
+    _frameServer->SetDesiredResolution(width, height);
 }
 
 HRESULT VirtualCamMediaStream::FireStreamStarted(const PROPVARIANT* pvarStartPosition)
@@ -144,26 +199,49 @@ STDMETHODIMP VirtualCamMediaStream::RequestSample(IUnknown* pToken)
     if (!_active)
         return MF_E_MEDIA_SOURCE_WRONGSTATE;
 
+    SyncDesiredResolution();
+
     BYTE*  srcData   = nullptr;
     DWORD  srcLength = 0;
     UINT64 frameIdx  = 0;
 
-    HRESULT hr = _frameServer->GetLatestFrame(&srcData, &srcLength, &frameIdx);
+    // Preallocate the max-size cache once; CopyLatestFrame overwrites it
+    // while holding the cross-process mutex, so the companion's writer can
+    // never tear a frame mid-copy.
+    if (_lastFrame.size() != MAX_FRAME_BYTES)
+        _lastFrame.resize(MAX_FRAME_BYTES);
 
-    if (SUCCEEDED(hr) && srcData && srcLength > 0)
+    HRESULT hr = _frameServer->CopyLatestFrame(_lastFrame.data(), (DWORD)_lastFrame.size(), &srcLength, &frameIdx);
+
+    if (SUCCEEDED(hr) && srcLength > 0)
     {
-        // Cache the newly retrieved frame
-        _lastFrame.assign(srcData, srcData + srcLength);
+        // The companion may still be mid-switch when the client negotiates a
+        // different resolution: the frame in shared memory then has a size
+        // that does not match the negotiated media type, and delivering it
+        // would render a garbled/colored frame. Deliver a black frame instead
+        // and wait for the next matching one — the client keeps running and
+        // gets real frames as soon as the companion matches the resolution.
+        if (_frameServer->GetWidth() != _curW || _frameServer->GetHeight() != _curH)
+        {
+            QueueBlankSample(pToken);
+            return S_OK;
+        }
+
+        _lastFrameLen = srcLength;
         _lastFrameIndex = frameIdx;
+    }
+    else if (FAILED(hr) && hr != E_PENDING)
+    {
+        _lastFrameLen = 0;
     }
 
     const BYTE* frameData = nullptr;
     DWORD       frameLen  = 0;
 
-    if (!_lastFrame.empty())
+    if (_lastFrameLen > 0)
     {
         frameData = _lastFrame.data();
-        frameLen  = (DWORD)_lastFrame.size();
+        frameLen  = _lastFrameLen;
     }
     else
     {
@@ -203,13 +281,38 @@ STDMETHODIMP VirtualCamMediaStream::RequestSample(IUnknown* pToken)
 
 void VirtualCamMediaStream::QueueBlankSample(IUnknown* pToken)
 {
+    // Deliver a real all-zero NV12 frame at the negotiated size. A
+    // buffer-less sample is ignored by DSHOW clients, which would then stall
+    // waiting for data; an actual black frame keeps them running and is
+    // replaced by real frames as soon as the companion catches up.
+    UINT32 w = _curW ? _curW : 1920;
+    UINT32 h = _curH ? _curH : 1080;
+    DWORD frameLen = w * h * 3 / 2;
+    if (frameLen > 1920 * 1080 * 3 / 2)  // sanity: never exceed the mapping
+        frameLen = 1920 * 1080 * 3 / 2;
+
     Microsoft::WRL::ComPtr<IMFSample> sample;
-    if (SUCCEEDED(MFCreateSample(&sample)))
-    {
-        if (pToken)
-            sample->SetUnknown(MFSampleExtension_Token, pToken);
-        _eventQueue->QueueEventParamUnk(MEMediaSample, GUID_NULL, S_OK, sample.Get());
-    }
+    if (FAILED(MFCreateSample(&sample)))
+        return;
+
+    Microsoft::WRL::ComPtr<IMFMediaBuffer> buffer;
+    if (FAILED(MFCreateMemoryBuffer(frameLen, &buffer)))
+        return;
+
+    BYTE* dst = nullptr;
+    if (FAILED(buffer->Lock(&dst, nullptr, nullptr)))
+        return;
+    ZeroMemory(dst, frameLen);
+    buffer->Unlock();
+    buffer->SetCurrentLength(frameLen);
+
+    sample->AddBuffer(buffer.Get());
+    sample->SetSampleTime(MFGetSystemTime());
+    sample->SetSampleDuration(333333); // ~30 fps in 100-nanosecond units
+
+    if (pToken)
+        sample->SetUnknown(MFSampleExtension_Token, pToken);
+    _eventQueue->QueueEventParamUnk(MEMediaSample, GUID_NULL, S_OK, sample.Get());
 }
 
 void VirtualCamMediaStream::Shutdown()
