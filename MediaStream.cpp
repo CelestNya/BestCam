@@ -140,7 +140,10 @@ HRESULT VirtualCamMediaStream::SetNegotiatedType(IMFMediaType* pType)
 void VirtualCamMediaStream::SetStreamDescriptor(IMFStreamDescriptor* pDescriptor)
 {
     if (pDescriptor)
+    {
         _streamDescriptor = pDescriptor;
+        _mediaTypeHandler = nullptr;  // the descriptor may have been replaced: drop the cached handler
+    }
 }
 
 void VirtualCamMediaStream::SetActive(bool active)
@@ -158,21 +161,34 @@ void VirtualCamMediaStream::SyncDesiredResolution()
     if (!_frameServer)
         return;
 
-    Microsoft::WRL::ComPtr<IMFMediaTypeHandler> handler;
-    if (FAILED(_streamDescriptor->GetMediaTypeHandler(&handler)))
-        return;
+    // The stream descriptor never changes for the lifetime of the stream;
+    // caching the handler avoids a COM AddRef/Release + object creation on
+    // every RequestSample (OBS can pull at its own pace, so this is the
+    // hottest per-frame path in the DLL).
+    if (!_mediaTypeHandler)
+    {
+        Microsoft::WRL::ComPtr<IMFMediaTypeHandler> handler;
+        if (FAILED(_streamDescriptor->GetMediaTypeHandler(&handler)))
+            return;
+        _mediaTypeHandler = handler;
+    }
 
     Microsoft::WRL::ComPtr<IMFMediaType> mediaType;
-    if (FAILED(handler->GetCurrentMediaType(&mediaType)))
+    if (FAILED(_mediaTypeHandler->GetCurrentMediaType(&mediaType)))
         return;
 
     UINT32 width = 0, height = 0;
     if (FAILED(MFGetAttributeSize(mediaType.Get(), MF_MT_FRAME_SIZE, &width, &height)))
         return;
 
-    _curW = width;
-    _curH = height;
-    _frameServer->SetDesiredResolution(width, height);
+    // Only touch shared memory when the negotiated size actually changed;
+    // the cross-process mutex + write used to run on every single sample.
+    if (width != _curW || height != _curH)
+    {
+        _curW = width;
+        _curH = height;
+        _frameServer->SetDesiredResolution(width, height);
+    }
 }
 
 HRESULT VirtualCamMediaStream::FireStreamStarted(const PROPVARIANT* pvarStartPosition)

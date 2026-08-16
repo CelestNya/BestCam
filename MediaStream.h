@@ -58,6 +58,7 @@ private:
 
     Microsoft::WRL::ComPtr<IMFMediaEventQueue> _eventQueue;
     Microsoft::WRL::ComPtr<IMFStreamDescriptor> _streamDescriptor;
+    Microsoft::WRL::ComPtr<IMFMediaTypeHandler> _mediaTypeHandler;  // cached: the descriptor never changes per stream
     Microsoft::WRL::ComPtr<VirtualCamMediaSource> _source;
     
     std::unique_ptr<FrameServer> _frameServer;
