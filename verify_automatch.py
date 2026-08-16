@@ -21,7 +21,7 @@ import time
 import cv2
 
 SHARED_MEM_NAME = "Global\\BestCam_SharedMem"
-REQS = [(1920, 1080), (1280, 720), (640, 480), (800, 600)]
+REQS = [(1920, 1080), (1280, 720), (800, 450), (640, 480), (800, 600)]
 
 
 class Hdr:
@@ -116,8 +116,16 @@ def main():
 
             time.sleep(2)
             hdr = Hdr()
-            cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
-            if not cap.isOpened():
+            # The host registers the camera asynchronously and the FrameServer
+            # loads the driver DLL on first activation; opening too early makes
+            # DSHOW fail with "can't be used to capture by index". Retry.
+            cap = None
+            for _ in range(4):
+                cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
+                if cap.isOpened():
+                    break
+                time.sleep(3)
+            if not cap or not cap.isOpened():
                 print(f"  request {rw}x{rh}: FAILED to open camera")
                 all_ok = False
                 continue

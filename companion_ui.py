@@ -350,12 +350,17 @@ class Bridge:
         return buf
 
     def _write_frame(self, ptr, bgr):
+        # Slices in flat byte offsets (w*h, w*h/4): the I420 U/V planes are
+        # (w/2)*(h/2) bytes each; row slicing breaks for odd heights (800x450
+        # -> h//4=112 rows = 89600 bytes vs 90000-byte U plane, numpy
+        # broadcast error).
         yuv = cv2.cvtColor(bgr, cv2.COLOR_BGR2YUV_I420)  # (H*3/2, W)
-        h, w = self._height, self._width
+        flat = yuv.ravel()
+        w, h = self._width, self._height
         nv12 = np.empty(self._frame_size, dtype=np.uint8)
-        nv12[:w * h] = yuv[:h].ravel()
-        nv12[w * h::2] = yuv[h: h + h // 4].ravel()
-        nv12[w * h + 1::2] = yuv[h + h // 4: h + h // 2].ravel()
+        nv12[:w * h] = flat[:w * h]
+        nv12[w * h::2] = flat[w * h: w * h + w * h // 4]
+        nv12[w * h + 1::2] = flat[w * h + w * h // 4: w * h + w * h // 2]
 
         if self._mutex:
             self._k32.WaitForSingleObject(self._mutex, 5)

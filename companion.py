@@ -182,11 +182,18 @@ class SharedMemWriter:
 
 
 def bgr_to_nv12(bgr: np.ndarray) -> np.ndarray:
-    """BGR -> NV12 (Y plane + interleaved UV), matching the driver's expectation."""
+    """BGR -> NV12 (Y plane + interleaved UV), matching the driver's expectation.
+
+    Slices are computed in flat byte offsets (w*h, w*h/4) instead of rows:
+    the I420 U/V planes are (w/2)*(h/2) bytes each, and row slicing breaks
+    for odd heights (800x450 has h//4=112 rows = 89600 bytes but the U plane
+    is 90000 bytes -> numpy broadcast error).
+    """
     yuv = cv2.cvtColor(bgr, cv2.COLOR_BGR2YUV_I420)  # shape (H*3/2, W)
-    y = yuv[:target_h].ravel()
-    u = yuv[target_h: target_h + target_h // 4].ravel()
-    v = yuv[target_h + target_h // 4: target_h + target_h // 2].ravel()
+    flat = yuv.ravel()
+    y = flat[:target_w * target_h]
+    u = flat[target_w * target_h: target_w * target_h + target_w * target_h // 4]
+    v = flat[target_w * target_h + target_w * target_h // 4: target_w * target_h + target_w * target_h // 2]
     nv12 = np.empty(frame_size(), dtype=np.uint8)
     nv12[:target_w * target_h] = y
     nv12[target_w * target_h::2] = u
