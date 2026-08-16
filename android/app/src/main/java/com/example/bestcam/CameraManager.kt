@@ -5,6 +5,7 @@ import android.content.Context
 import android.graphics.ImageFormat
 import android.graphics.Rect
 import android.graphics.YuvImage
+import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CaptureRequest
 import android.util.Log
 import android.util.Range
@@ -12,6 +13,7 @@ import android.util.Size
 import androidx.camera.core.*
 import androidx.camera.core.resolutionselector.ResolutionSelector
 import androidx.camera.core.resolutionselector.ResolutionStrategy
+import androidx.camera.camera2.interop.Camera2CameraInfo
 import androidx.camera.camera2.interop.Camera2Interop
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
@@ -93,16 +95,18 @@ class CameraManager(
             )
             .build()
         // CameraX (1.3.x) does not expose setTargetFrameRate; without an AE
-        // fps hint this sensor's analysis stream defaults to a ~12fps range.
-        // Pin the CaptureRequest to the fixed [30,30] range the device
-        // advertises (aeAvailableTargetFpsRanges).
+        // fps hint some sensors' analysis streams default to a low range
+        // (observed ~12fps on a 1940x1940 sensor). Pin the CaptureRequest to
+        // the range selectAeFpsRange picks from what the device advertises —
+        // device-independent, no hardcoded values.
+        val aeRange = selectAeFpsRange(cameraProvider)
         val analysisBuilder = ImageAnalysis.Builder()
             .setResolutionSelector(analysisSelector)
             .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
         Camera2Interop.Extender(analysisBuilder)
             .setCaptureRequestOption(
                 CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE,
-                Range(30, 30)
+                aeRange
             )
         imageAnalyzer = analysisBuilder.build()
             .also {
@@ -136,6 +140,38 @@ class CameraManager(
             server.sendFrame(jpegData)
         }
         imageProxy.close()
+    }
+
+    /** Pick the best AE target fps range this camera advertises.
+     *
+     * Preference: the highest fixed range at >=25fps (e.g. [30,30]) → the
+     * range with the highest upper bound overall (fixed or variable) → [30,30]
+     * as a last resort when the metadata is unavailable (drivers then clamp
+     * or ignore the request). Device-independent: no hardcoded values.
+     */
+    private fun selectAeFpsRange(
+        cameraProvider: ProcessCameraProvider
+    ): Range<Int> {
+        try {
+            val info = cameraProvider.getAvailableCameraInfos()
+                .firstOrNull { it.lensFacing == lensFacing }
+            val ranges = info?.let { cameraInfo ->
+                Camera2CameraInfo.from(cameraInfo).getCameraCharacteristic(
+                    CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES
+                )
+            }
+            if (ranges != null && ranges.isNotEmpty()) {
+                val fixed = ranges.filter { it.lower == it.upper }
+                val bestFixed = fixed.maxByOrNull { it.upper }
+                if (bestFixed != null && bestFixed.upper >= 25) {
+                    return bestFixed
+                }
+                return ranges.maxByOrNull { it.upper } ?: Range(30, 30)
+            }
+        } catch (e: Exception) {
+            Log.w("CameraManager", "AE fps range lookup failed, defaulting to [30,30]", e)
+        }
+        return Range(30, 30)
     }
 
     /** Convert the frame to a 1280x720 (16:9, center-cropped) JPEG.
