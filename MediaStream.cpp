@@ -151,11 +151,11 @@ void VirtualCamMediaStream::SetActive(bool active)
     _active = active;
 }
 
-// Read the currently negotiated media type and publish the resolution into
-// the shared memory header so the companion script can auto-match its
-// output. Called on every RequestSample: the negotiated type can change
-// between client open() calls (and even per-open), so the desired field
-// must reflect it promptly to shrink the mismatch window.
+// Track the currently negotiated media type so RequestSample can compare it
+// against the frame size in shared memory (a mismatch means the companion is
+// mid-switch and black frames are delivered instead of garbled ones). Called
+// on every RequestSample: the negotiated type can change between client
+// open() calls (and even per-open).
 void VirtualCamMediaStream::SyncDesiredResolution()
 {
     if (!_frameServer)
@@ -181,14 +181,8 @@ void VirtualCamMediaStream::SyncDesiredResolution()
     if (FAILED(MFGetAttributeSize(mediaType.Get(), MF_MT_FRAME_SIZE, &width, &height)))
         return;
 
-    // Only touch shared memory when the negotiated size actually changed;
-    // the cross-process mutex + write used to run on every single sample.
-    if (width != _curW || height != _curH)
-    {
-        _curW = width;
-        _curH = height;
-        _frameServer->SetDesiredResolution(width, height);
-    }
+    _curW = width;
+    _curH = height;
 }
 
 HRESULT VirtualCamMediaStream::FireStreamStarted(const PROPVARIANT* pvarStartPosition)

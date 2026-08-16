@@ -5,7 +5,7 @@
 #include "Logger.h"
 #include <mferror.h>
 
-// 32-byte header + NV12 frame size (1920x1080)
+// 24-byte header + NV12 frame size (1920x1080)
 static const DWORD TOTAL_MEM_SIZE = sizeof(SharedMemHeader) - 1 + 1920 * 1080 * 3 / 2;
 
 FrameServer::FrameServer()
@@ -88,8 +88,7 @@ HRESULT FrameServer::Initialize()
     }
 
     // We created the mapping: zero-initialize and set up default metadata so
-    // the companion script knows the dimensions we expect. desired stays 0
-    // until a client negotiates a media type (SetDesiredResolution).
+    // the companion script knows the dimensions we expect.
     ZeroMemory(_header, sizeof(SharedMemHeader));
     _header->width     = 1920;
     _header->height    = 1080;
@@ -162,16 +161,3 @@ HRESULT FrameServer::CopyLatestFrame(BYTE* dst, DWORD capacity, DWORD* length, U
 
 UINT32 FrameServer::GetWidth()  const { return _header ? _header->width  : 0; }
 UINT32 FrameServer::GetHeight() const { return _header ? _header->height : 0; }
-
-void FrameServer::SetDesiredResolution(UINT32 width, UINT32 height)
-{
-    if (!_header || width == 0 || height == 0)
-        return;
-
-    if (_hMutex)
-        WaitForSingleObject(_hMutex, 5);
-    _header->desiredWidth  = width;
-    _header->desiredHeight = height;
-    if (_hMutex)
-        ReleaseMutex(_hMutex);
-}

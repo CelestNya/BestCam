@@ -11,10 +11,8 @@
 #define MUTEX_NAME      L"Global\\BestCam_Mutex"
 
 // Data layout of the shared memory mapping
-// First 24 bytes (width..frameIndex) are written by the companion script every
-// frame. desiredWidth/desiredHeight are written by the driver when a client
-// negotiates a media type (e.g. ExVR opening the camera), and read by the
-// companion to auto-match its output resolution. 0 = not negotiated yet.
+// 24 bytes (width..frameIndex) are written by the companion script every
+// frame; NV12 data follows immediately (offset 24). Matches upstream.
 #pragma pack(push, 1)
 struct SharedMemHeader
 {
@@ -23,9 +21,7 @@ struct SharedMemHeader
     UINT32  stride;
     UINT32  frameSize;
     UINT64  frameIndex;      // Monotonically increasing index for each new frame
-    UINT32  desiredWidth;    // Client-requested resolution (driver -> companion)
-    UINT32  desiredHeight;   // 0 = no client has negotiated yet
-    UINT8   data[1];         // Start of the NV12 frame buffer (offset 32)
+    UINT8   data[1];         // Start of the NV12 frame buffer (offset 24)
 };
 #pragma pack(pop)
 
@@ -38,7 +34,6 @@ public:
     HRESULT Initialize();
     HRESULT GetLatestFrame(BYTE** data, DWORD* length, UINT64* frameIndex);
     HRESULT CopyLatestFrame(BYTE* dst, DWORD capacity, DWORD* length, UINT64* frameIndex);
-    void SetDesiredResolution(UINT32 width, UINT32 height);
 
     UINT32 GetWidth() const;
     UINT32 GetHeight() const;
