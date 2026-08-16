@@ -164,15 +164,19 @@ class SharedMemWriter:
         self._frame_index = 0
 
     def write(self, nv12: np.ndarray):
-        if self._mutex:
-            self._k32.WaitForSingleObject(self._mutex, 5)
+        if not self._mutex:
+            return
         # Data first, header last: the header (frameIndex) is the "data ready"
         # signal. Writing it first would let the driver read the new frameSize
         # against the previous frame's data -> one garbled frame per switch.
-        ctypes.memmove(self._ptr + DATA_OFFSET, nv12.ctypes.data, frame_size())
-        hdr = struct.pack("<4IQ", target_w, target_h, target_w, frame_size(), self._frame_index)
-        ctypes.memmove(self._ptr, hdr, HEADER_SIZE)
-        if self._mutex:
+        # try/finally guarantees ReleaseMutex on any exception (e.g. Ctrl+C),
+        # otherwise the mutex is left abandoned and later writes run lockless.
+        try:
+            self._k32.WaitForSingleObject(self._mutex, 5)
+            ctypes.memmove(self._ptr + DATA_OFFSET, nv12.ctypes.data, frame_size())
+            hdr = struct.pack("<4IQ", target_w, target_h, target_w, frame_size(), self._frame_index)
+            ctypes.memmove(self._ptr, hdr, HEADER_SIZE)
+        finally:
             self._k32.ReleaseMutex(self._mutex)
         self._frame_index += 1
 
