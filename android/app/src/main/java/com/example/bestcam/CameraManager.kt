@@ -40,7 +40,6 @@ class CameraManager(
     var quality: Int = 55
     var isBeautyFilterEnabled = false
 
-    private var nv21Buffer: ByteArray? = null
     private val jpegOutStream = ThreadLocal.withInitial { ByteArrayOutputStream(200_000) }
     private var yRow = ByteArray(0)
     private var uRow = ByteArray(0)
@@ -233,45 +232,6 @@ class CameraManager(
         }
     }
 
-    private fun yuv420ToNv21(image: ImageProxy, nv21: ByteArray) {
-        val width = image.width
-        val height = image.height
-        val planes = image.planes
-        val yBuffer = planes[0].buffer
-        val uBuffer = planes[1].buffer
-        val vBuffer = planes[2].buffer
-
-        // Copy Y plane
-        val yRowStride = planes[0].rowStride
-        if (yRowStride == width) {
-            yBuffer.get(nv21, 0, width * height)
-        } else {
-            for (row in 0 until height) {
-                yBuffer.position(row * yRowStride)
-                yBuffer.get(nv21, row * width, width)
-            }
-        }
-
-        // Copy interleaved U/V planes (NV21 format is YYYY... VUVU...)
-        val vRowStride = planes[2].rowStride
-        val vPixelStride = planes[2].pixelStride
-        val uRowStride = planes[1].rowStride
-        val uPixelStride = planes[1].pixelStride
-        
-        var pos = width * height
-        
-        if (vPixelStride == 2 && vBuffer.remaining() == (width * height / 2 - 1)) {
-            vBuffer.get(nv21, pos, vBuffer.remaining())
-        } else {
-            for (row in 0 until height / 2) {
-                for (col in 0 until width / 2) {
-                    val vIdx = row * vRowStride + col * vPixelStride
-                    val uIdx = row * uRowStride + col * uPixelStride
-                    nv21[pos++] = vBuffer.get(vIdx)
-                    nv21[pos++] = uBuffer.get(uIdx)
-                }
-            }
-        }    }
 
     private fun applyBeautyFilter(nv21: ByteArray, width: Int, height: Int): ByteArray {
         val brightnessBoost = 25
