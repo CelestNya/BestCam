@@ -109,6 +109,7 @@ class Bridge:
         self._writer = None
         self._thread = None
         self._stop = threading.Event()
+        self._sock = None
         self._mutex = None
         self.status_text = "Idle"
         self.fps = 0.0
@@ -177,6 +178,12 @@ class Bridge:
         self._width, self._height = width, height
         self._frame_size = width * height * 3 // 2
         if running:
+            # The old thread may still be alive (recv shutdown takes a
+            # moment); start() refuses to spawn a second stream, so wait
+            # for it to exit first.
+            deadline = time.time() + 15
+            while self._thread is not None and self._thread.is_alive() and time.time() < deadline:
+                time.sleep(0.05)
             self.start()
 
     @property
@@ -191,15 +198,28 @@ class Bridge:
     def start(self):
         if self.running:
             return
-        self._stop.clear()
+        # Fresh event per start: a stale thread blocked in recv() holds its
+        # own event object and can never see this one get cleared, so it must
+        # exit when it eventually wakes up (guards against duplicate streams).
+        self._stop = threading.Event()
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
 
     def stop(self):
         self._stop.set()
+        # Unblock a thread stuck in recv(): shutdown makes the socket error
+        # out immediately so join() completes instead of timing out and
+        # leaving a half-dead thread behind.
+        sock = self._sock
+        if sock is not None:
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
         if self._thread:
             self._thread.join(timeout=3)
-            self._thread = None
+            if not self._thread.is_alive():
+                self._thread = None
         self._status("Stopped")
 
     def restart_adb(self):
@@ -303,13 +323,14 @@ class Bridge:
 
     def _stream_loop(self, h_map, ptr):
         sock = socket.create_connection(("127.0.0.1", PORT), timeout=5)
-        first = sock.recv(4096)
-        while b"\r\n\r\n" not in first:
-            first += sock.recv(4096)
-        pending = first.split(b"\r\n\r\n", 1)[1]
-        sock.settimeout(10)
-        self._status(f"Streaming {self._width}x{self._height} -> BestCam driver")
+        self._sock = sock
         try:
+            first = sock.recv(4096)
+            while b"\r\n\r\n" not in first:
+                first += sock.recv(4096)
+            pending = first.split(b"\r\n\r\n", 1)[1]
+            sock.settimeout(10)
+            self._status(f"Streaming {self._width}x{self._height} -> BestCam driver")
             while not self._stop.is_set():
                 if len(pending) < 4:
                     pending += self._recv_exact(sock, 4 - len(pending))
@@ -339,6 +360,8 @@ class Bridge:
                 self._write_frame(ptr, bgr)
         finally:
             sock.close()
+            if self._sock is sock:
+                self._sock = None
 
     def _recv_exact(self, sock, n):
         buf = b""
