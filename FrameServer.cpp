@@ -102,31 +102,6 @@ HRESULT FrameServer::Initialize()
     return S_OK;
 }
 
-HRESULT FrameServer::GetLatestFrame(BYTE** data, DWORD* length, UINT64* frameIndex)
-{
-    if (!_header)
-        return E_FAIL;
-
-    if (_hMutex)
-        WaitForSingleObject(_hMutex, 5);
-
-    // If the frame index hasn't changed, there is no new frame
-    if (_header->frameIndex == _lastIndex)
-    {
-        if (_hMutex) ReleaseMutex(_hMutex);
-        return E_PENDING;
-    }
-
-    // Pass back pointers directly into the shared memory segment
-    *data       = _header->data;
-    *length     = _header->frameSize;
-    *frameIndex = _header->frameIndex;
-    _lastIndex  = _header->frameIndex;
-
-    if (_hMutex) ReleaseMutex(_hMutex);
-    return S_OK;
-}
-
 // Copy the latest frame into a caller-owned buffer while holding the mutex,
 // so the companion's writer (which also holds the mutex) cannot tear the
 // frame mid-copy. This is what the stream uses for its per-frame cache.

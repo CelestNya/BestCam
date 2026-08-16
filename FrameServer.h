@@ -32,7 +32,6 @@ public:
     ~FrameServer();
 
     HRESULT Initialize();
-    HRESULT GetLatestFrame(BYTE** data, DWORD* length, UINT64* frameIndex);
     HRESULT CopyLatestFrame(BYTE* dst, DWORD capacity, DWORD* length, UINT64* frameIndex);
 
     UINT32 GetWidth() const;

@@ -161,10 +161,11 @@ void VirtualCamMediaStream::SyncDesiredResolution()
     if (!_frameServer)
         return;
 
-    // The stream descriptor never changes for the lifetime of the stream;
-    // caching the handler avoids a COM AddRef/Release + object creation on
-    // every RequestSample (OBS can pull at its own pace, so this is the
-    // hottest per-frame path in the DLL).
+    // The descriptor is replaced only when the stream is rebuilt on Start,
+    // which invalidates the cached handler (SetStreamDescriptor); the cache
+    // therefore never goes stale. It avoids a COM AddRef/Release + object
+    // creation on every RequestSample (OBS can pull at its own pace, so this
+    // is the hottest per-frame path in the DLL).
     if (!_mediaTypeHandler)
     {
         Microsoft::WRL::ComPtr<IMFMediaTypeHandler> handler;
@@ -233,6 +234,10 @@ STDMETHODIMP VirtualCamMediaStream::RequestSample(IUnknown* pToken)
         // gets real frames as soon as the companion matches the resolution.
         if (_frameServer->GetWidth() != _curW || _frameServer->GetHeight() != _curH)
         {
+            // The just-copied frame is the wrong size for the negotiated media
+            // type; invalidate the cache so subsequent pulls (E_PENDING) blank
+            // instead of delivering stale data at the previous resolution.
+            _lastFrameLen = 0;
             QueueBlankSample(pToken);
             return S_OK;
         }
