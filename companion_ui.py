@@ -110,9 +110,6 @@ class Bridge:
         self._thread = None
         self._stop = threading.Event()
         self._mutex = None
-        self._last_desired = None  # last seen client-negotiated resolution
-        self._pending_desired = None  # debounce candidate + stable-since stamp
-        self._pending_since = 0.0
         self.status_text = "Idle"
         self.fps = 0.0
         self._fps_frames = 0
@@ -171,7 +168,8 @@ class Bridge:
         return sa, sd
 
     def set_resolution(self, width, height):
-        """Switch output resolution; client must re-open the camera."""
+        """Switch output resolution manually; the client must request the same
+        size (ExVR/OBS setting or re-open), otherwise frames stay black."""
         if (width, height) == (self._width, self._height):
             return
         running = self.running
@@ -180,42 +178,6 @@ class Bridge:
         self._frame_size = width * height * 3 // 2
         if running:
             self.start()
-
-    def _check_desired(self, ptr):
-        """Auto-match the resolution the driver negotiated with the client.
-
-        Only follows when the negotiated value *changes* from what we last
-        saw (_last_desired), so a manual tray selection is never overridden
-        until the client re-negotiates a different resolution. A short
-        debounce (300 ms) absorbs the probe-vs-open fight where the driver
-        briefly publishes several resolutions while a client opens."""
-        raw = ctypes.string_at(ptr + DESIRED_OFFSET, 8)
-        w, h = struct.unpack("<II", raw)
-        if w == 0 or h == 0:
-            return
-        # sanity guard: a corrupted field must never feed resize/alloc
-        if not (320 <= w <= 4096 and 320 <= h <= 4096):
-            return
-        if (w, h) == self._last_desired:
-            return
-        now = time.monotonic()
-        if (w, h) != self._pending_desired:
-            self._pending_desired = (w, h)
-            self._pending_since = now
-            return
-        # 1.5s debounce: DSHOW opens negotiate the default 640x480 before the
-        # requested size; following those transients makes the client's graph
-        # rebuild its media type twice and then stop pulling samples (black
-        # frames). Only switch after the value has been stable for 1.5s.
-        if now - self._pending_since < 1.5:
-            return
-        self._pending_desired = None
-        self._last_desired = (w, h)
-        if (w, h) == (self._width, self._height):
-            return
-        self._width, self._height = w, h
-        self._frame_size = w * h * 3 // 2
-        self._status(f"Auto-matched client resolution: {w}x{h}")
 
     @property
     def running(self):
@@ -349,10 +311,6 @@ class Bridge:
         self._status(f"Streaming {self._width}x{self._height} -> BestCam driver")
         try:
             while not self._stop.is_set():
-                # Auto-match the client's negotiated resolution (checked every
-                # frame; an 8-byte read is ~1us, and it keeps the switchover
-                # gap to a single frame instead of ~15)
-                self._check_desired(ptr)
                 if len(pending) < 4:
                     pending += self._recv_exact(sock, 4 - len(pending))
                 soi = pending.find(b"\xff\xd8")

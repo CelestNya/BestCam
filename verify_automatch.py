@@ -1,14 +1,16 @@
-"""verify_automatch.py — End-to-end test of auto-resolution matching.
+"""verify_automatch.py — End-to-end test of manual resolution matching.
 
-Launches BestCamHost + the new companion (auto-match logic), then simulates a
-client (cv2) negotiating each supported resolution and verifies that:
+Launches BestCamHost + the companion at a MANUALLY chosen resolution
+(BESTCAM_WIDTH/HEIGHT env vars, one restart per step), then simulates a
+client (cv2) requesting the same size and verifies that:
   1. The driver publishes the negotiated size in the header (desired*).
-  2. The companion switches its output to match (header width/height).
+  2. The companion keeps its manually selected output (header width/height).
   3. The received frame is color-sane (no NV12 mismatch -> no black/garbled).
 
 Usage: python verify_automatch.py <companion.py path> <host path>
 """
 import ctypes
+import os
 import queue
 import struct
 import subprocess
@@ -56,6 +58,35 @@ def wait_for(hdr, want_out, want_desired, timeout=8.0, label=""):
     return False
 
 
+def start_companion(companion_py, width, height, out_q):
+    env = dict(os.environ)
+    env["BESTCAM_WIDTH"] = str(width)
+    env["BESTCAM_HEIGHT"] = str(height)
+    companion = subprocess.Popen(
+        [sys.executable, "-u", companion_py],  # -u: unbuffered output
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env)
+
+    def pump():
+        for line in companion.stdout:
+            out_q.put(line)
+
+    threading.Thread(target=pump, daemon=True).start()
+    return companion
+
+
+def wait_streaming(out_q, timeout=30.0):
+    t0 = time.time()
+    while time.time() - t0 < timeout:
+        try:
+            line = out_q.get(timeout=0.5)
+        except queue.Empty:
+            continue
+        print("  [companion]", line.rstrip())
+        if "Stream connected" in line:
+            return True
+    return False
+
+
 def main():
     companion_py, host_exe = sys.argv[1], sys.argv[2]
     # The host blocks on getchar(), so it must keep a console: use SW_HIDE
@@ -67,47 +98,24 @@ def main():
     startupinfo.wShowWindow = 0  # SW_HIDE
     host = subprocess.Popen([host_exe], startupinfo=startupinfo,
                             stdin=subprocess.PIPE)
-    try:
-        companion = subprocess.Popen(
-            [sys.executable, "-u", companion_py],  # -u: unbuffered output
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-    except Exception as exc:
-        print("companion failed:", exc)
-        return 1
 
-    # Pump companion output through a queue so the wait loop below can time
-    # out (readline() on a pipe would block forever on Windows).
     out_q = queue.Queue()
-
-    def pump():
-        for line in companion.stdout:
-            out_q.put(line)
-
-    threading.Thread(target=pump, daemon=True).start()
-
+    companion = None
+    all_ok = True
     try:
-        # Wait for the companion to start streaming (phone stream present?)
-        t0 = time.time()
-        while time.time() - t0 < 30:
-            try:
-                line = out_q.get(timeout=0.5)
-            except queue.Empty:
-                continue
-            print("  [companion]", line.rstrip())
-            if "Stream connected" in line:
-                break
-        else:
-            print("companion never connected to the phone stream")
-            return 1
-
-        time.sleep(2)
-        hdr = Hdr()
-        w, h, idx, dw, dh = hdr.read()
-        print(f"initial header: out={w}x{h} idx={idx} desired={dw}x{dh}")
-
-        all_ok = True
         for rw, rh in REQS:
-            print(f"== client requests {rw}x{rh}")
+            print(f"== manual output {rw}x{rh}; client requests {rw}x{rh}")
+            if companion:
+                companion.kill()
+                companion.wait()
+            companion = start_companion(companion_py, rw, rh, out_q)
+            if not wait_streaming(out_q):
+                print(f"  companion never connected for {rw}x{rh}")
+                all_ok = False
+                continue
+
+            time.sleep(2)
+            hdr = Hdr()
             cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
             if not cap.isOpened():
                 print(f"  request {rw}x{rh}: FAILED to open camera")
@@ -148,7 +156,8 @@ def main():
         print("ALL PASS" if all_ok else "FAILURES PRESENT")
         return 0 if all_ok else 1
     finally:
-        companion.kill()
+        if companion:
+            companion.kill()
         host.kill()
 
 

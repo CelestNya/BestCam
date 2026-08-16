@@ -15,12 +15,13 @@ chain can run below 1080p:
     BESTCAM_HEIGHT  (default 1080)
     BESTCAM_ADB     (optional, path to adb.exe; defaults to "adb" on PATH)
 
-The negotiated resolution must match what the client (e.g. ExVR) requests:
-the MF source advertises 1920x1080 / 1280x720 / 800x600 / 800x450 / 640x480
-(NV12, 30fps). Since the driver publishes the client's negotiated resolution
-in the shared memory header (desiredWidth/desiredHeight), this script now
-auto-matches it: no need to pick BESTCAM_WIDTH/HEIGHT by hand, though the
-env vars still set the initial output.
+Switching resolution is MANUAL: pick BESTCAM_WIDTH/HEIGHT (or the tray menu
+in the UI build) and make the client (e.g. ExVR) request the same size. The
+MF source advertises 1920x1080 / 1280x720 / 800x600 / 800x450 / 640x480
+(NV12, 30fps). If the client requests a different size, the driver delivers
+black frames until the two sides match (the driver still publishes the
+client's negotiated resolution in desiredWidth/desiredHeight, but it is only
+informational now).
 
 Shared memory layout (32-byte header + NV12 frame):
   Offset  0 : UINT32 width
@@ -33,7 +34,7 @@ Shared memory layout (32-byte header + NV12 frame):
   Offset 32 : NV12 data (Y plane + interleaved UV)
 
 Usage:
-  python companion.py            # 1080p initial output, auto-matches clients
+  python companion.py            # 1080p output (manual)
   BESTCAM_WIDTH=1280 BESTCAM_HEIGHT=720 python companion.py
 """
 import ctypes
@@ -165,41 +166,6 @@ class SharedMemWriter:
         if not self._mutex:
             raise RuntimeError("CreateMutexW failed")
         self._frame_index = 0
-        self._pending = None   # candidate resolution waiting out the debounce
-        self._since = 0.0
-
-    def check_desired(self):
-        """Auto-match the client's negotiated resolution published by the
-        driver. Returns True when the output resolution changed."""
-        global target_w, target_h
-        raw = ctypes.string_at(self._ptr + DESIRED_OFFSET, 8)
-        w, h = struct.unpack("<II", raw)
-        if w == 0 or h == 0:
-            return False
-        # sanity guard: a corrupted field must never feed resize/alloc
-        if not (320 <= w <= 4096 and 320 <= h <= 4096):
-            return False
-        if (w, h) == (target_w, target_h):
-            return False
-        # Debounce: while a client opens the camera, the driver can publish
-        # several different negotiated resolutions (probe vs final open) that
-        # fight over the desired field for a while. DSHOW opens negotiate the
-        # default 640x480 first, then the requested size; following those
-        # transient values makes the client's graph rebuild its media type
-        # twice, and after the second rebuild DSHOW stops pulling samples
-        # (black frames). Only switch after the value has been stable for
-        # 1.5s, which filters probe transients while still following a real
-        # resolution change (a client that switched stays on the new size).
-        if (w, h) != self._pending:
-            self._pending = (w, h)
-            self._since = time.time()
-            return False
-        if time.time() - self._since < 1.5:
-            return False
-        self._pending = None
-        target_w, target_h = w, h
-        print(f"Client requested {w}x{h}: auto-matching output resolution")
-        return True
 
     def write(self, nv12: np.ndarray):
         if self._mutex:
@@ -292,11 +258,6 @@ def main():
                     pending += recv_exact(sock, 4096)
                 jpeg = pending[soi: soi + cl]
                 pending = pending[soi + cl:]
-
-                # Auto-match the client's negotiated resolution (checked every
-                # frame; an 8-byte read is ~1us, and it keeps the switchover
-                # gap to a single frame instead of ~15)
-                writer.check_desired()
 
                 bgr = cv2.imdecode(np.frombuffer(jpeg, dtype=np.uint8), cv2.IMREAD_COLOR)
                 if bgr is None:
