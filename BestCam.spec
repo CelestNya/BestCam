@@ -1,11 +1,21 @@
 # -*- mode: python ; coding: utf-8 -*-
 from PyInstaller.utils.hooks import collect_all
 
+# Bundle the FFmpeg binary used for optional hardware decoding.
+try:
+    from imageio_ffmpeg import get_ffmpeg_exe
+    ffmpeg_binary = get_ffmpeg_exe()
+except Exception:
+    ffmpeg_binary = None
+
 datas = []
-binaries = []
+binaries = [(ffmpeg_binary, '.')] if ffmpeg_binary else []
 hiddenimports = ['PIL.Image', 'win32event']
-tmp_ret = collect_all('pystray')
-datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
+for pkg in ('pystray', 'av', 'imageio_ffmpeg'):
+    tmp_ret = collect_all(pkg)
+    datas += tmp_ret[0]
+    binaries += tmp_ret[1]
+    hiddenimports += tmp_ret[2]
 
 
 a = Analysis(

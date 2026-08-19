@@ -21,6 +21,13 @@ import time
 import cv2
 import numpy as np
 
+from decoder import (
+    FFmpegHwDecoder,
+    PyAVH264Decoder,
+    SoftDecoder,
+    list_hw_devices,
+)
+
 SHARED_MEM_NAME = "Global\\BestCam_SharedMem"
 MUTEX_NAME = "Global\\BestCam_Mutex"
 HEADER_SIZE = 24      # metadata portion of the header (width..frameIndex)
@@ -96,6 +103,7 @@ class MjpegFrameReader:
         self._buf += data
 
     def read_frame(self):
+        """Return (frame_bytes, content_type) or None."""
         while True:
             # 1) 上限保护：超限从下一个 boundary 重新同步（丢弃垃圾）
             if len(self._buf) > self.MAX_BUFFER:
@@ -123,15 +131,17 @@ class MjpegFrameReader:
                 del self._buf[:1]
                 continue
 
-            # 4) 解析 Content-Length；无法确定帧长则跳过该头继续找
+            # 4) 解析 Content-Length 与 Content-Type；无法确定帧长则跳过该头
             cl = None
+            mime = "image/jpeg"
             for line in self._buf[0:h_end].split(b"\r\n"):
                 if line.lower().startswith(b"content-length:"):
                     try:
                         cl = int(line.split(b":", 1)[1].strip())
                     except ValueError:
                         cl = None
-                    break
+                elif line.lower().startswith(b"content-type:"):
+                    mime = line.split(b":", 1)[1].strip().decode("ascii", "ignore")
             if cl is None or cl <= 0 or cl > self.MAX_JPEG:
                 del self._buf[:h_end + 4]
                 continue
@@ -143,10 +153,10 @@ class MjpegFrameReader:
             jpeg = bytes(self._buf[jpeg_start:jpeg_start + cl])
             del self._buf[:jpeg_start + cl]
 
-            # 6) EOI 校验：JPEG 必须以 0xFFD9 结束，坏帧丢弃继续同步
-            if len(jpeg) < 4 or jpeg[-2:] != b"\xff\xd9":
+            # 6) 格式校验：JPEG 必须以 0xFFD9 结束；H.264 直接放行
+            if mime == "image/jpeg" and (len(jpeg) < 4 or jpeg[-2:] != b"\xff\xd9"):
                 continue
-            return jpeg
+            return jpeg, mime
 
 
 class Bridge:
@@ -163,12 +173,12 @@ class Bridge:
         self._width = width
         self._height = height
         self._fps = 30
+        self._codec = os.environ.get("BESTCAM_CODEC", "h264").lower()
+        self._hwaccel = os.environ.get("BESTCAM_HWACCEL", "d3d11va").lower()
+        self._use_hw = os.environ.get("BESTCAM_USE_HW", "").lower() in ("1", "true", "yes")
         self._frame_size = width * height * 3 // 2
         self._on_status = on_status
-        # Phone capability table: list of (w, h, max_fps, encode_ms) as
-        # reported by the phone's control channel. The tray menu only offers
-        # these combinations (conditional options), and the driver advertises
-        # exactly the current one.
+        # Phone capability table: list of (w, h, max_fps, encode_ms, codec).
         self._caps = []
         self._caps_t0 = 0.0
         self._k32 = ctypes.WinDLL("kernel32", use_last_error=True)
@@ -197,7 +207,10 @@ class Bridge:
         self._stop = threading.Event()
         self._sock = None
         self._mutex = None
+        self._decoder = None
+        self._decoder_lock = threading.Lock()
         self.status_text = "Idle"
+        self.decoder_text = "CPU"
         self.fps = 0.0
         self._fps_frames = 0
         self._fps_t0 = time.time()
@@ -254,21 +267,26 @@ class Bridge:
         sa.lpSecurityDescriptor = ctypes.cast(ctypes.byref(sd), ctypes.c_void_p).value
         return sa, sd
 
-    def set_resolution(self, width, height, fps=None):
-        """Switch output resolution; the client must request the same
-        size (ExVR/OBS setting or re-open), otherwise frames stay black."""
+    def set_resolution(self, width, height, fps=None, codec=None):
+        """Switch output resolution and codec; the client must request the
+        same size (ExVR/OBS setting or re-open), otherwise frames stay black."""
+        old_w, old_h, old_codec = self._width, self._height, self._codec
+        if codec is None:
+            cap = self._find_cap(width, height, prefer_codec="h264")
+            codec = (cap[4] if cap else old_codec).lower()
         if fps is None:
-            cap = self._find_cap(width, height)
+            cap = self._find_cap(width, height, codec=codec)
             fps = cap[2] if cap else self._fps
-        self._send_control(f"set_resolution {width} {height} {fps}")
-        if (width, height) == (self._width, self._height):
-            self._fps = fps
+        self._codec = codec
+        self._send_control(f"set_resolution {width} {height} {fps} {codec}")
+        changed = (width, height, codec) != (old_w, old_h, old_codec)
+        self._width, self._height, self._fps = width, height, fps
+        self._frame_size = width * height * 3 // 2
+        self._release_decoder()
+        if not changed:
             return
         running = self.running
         self.stop()
-        self._width, self._height = width, height
-        self._fps = fps
-        self._frame_size = width * height * 3 // 2
         if running:
             # The old thread may still be alive (recv shutdown takes a
             # moment); start() refuses to spawn a second stream, so wait
@@ -307,7 +325,8 @@ class Bridge:
         caps = []
         try:
             for r in json.loads(body).get("resolutions", []):
-                caps.append((int(r["w"]), int(r["h"]), int(r["max_fps"]), int(r.get("encode_ms", 0))))
+                caps.append((int(r["w"]), int(r["h"]), int(r["max_fps"]),
+                             int(r.get("encode_ms", 0)), str(r.get("codec", "mjpeg"))))
         except (ValueError, TypeError, KeyError):
             pass
         return caps
@@ -322,18 +341,25 @@ class Bridge:
         except OSError:
             pass
 
-    def _find_cap(self, width, height):
-        """Best capability for (w,h): exact match, else same aspect, else closest."""
+    def _find_cap(self, width, height, codec=None, prefer_codec="h264"):
+        """Best capability for (w,h). Prefer the requested codec, then the
+        preferred codec, then any codec for this resolution, then closest."""
         caps = self.capabilities
         if not caps:
             return None
-        for c in caps:
-            if c[0] == width and c[1] == height:
+        candidates = [c for c in caps if c[0] == width and c[1] == height]
+        if not candidates:
+            candidates = [c for c in caps if c[0] * height == c[1] * width]
+        if not candidates:
+            candidates = caps
+        if codec:
+            for c in candidates:
+                if c[4].lower() == codec.lower():
+                    return c
+        for c in candidates:
+            if c[4].lower() == prefer_codec.lower():
                 return c
-        for c in caps:
-            if c[0] * height == c[1] * width:
-                return c
-        return min(caps, key=lambda c: abs(c[0] * c[1] - width * height))
+        return candidates[0]
 
     @property
     def running(self):
@@ -342,6 +368,57 @@ class Bridge:
     @property
     def resolution(self):
         return self._width, self._height
+
+    @property
+    def codec(self):
+        return self._codec
+
+    def set_hwaccel(self, hwaccel: str):
+        """Set the preferred hardware accelerator ('cpu' for PyAV software)."""
+        self._hwaccel = hwaccel.lower()
+        self._use_hw = self._hwaccel != "cpu"
+        self._release_decoder()
+
+    def _release_decoder(self):
+        with self._decoder_lock:
+            self._release_decoder_unsafe()
+
+    def _release_decoder_unsafe(self):
+        if self._decoder is not None:
+            try:
+                self._decoder.release()
+            except Exception:
+                pass
+            self._decoder = None
+        self.decoder_text = "CPU"
+
+    def _decoder_for(self, mime: str):
+        """Return a decoder suitable for the incoming MIME type."""
+        with self._decoder_lock:
+            if self._decoder is not None:
+                # Reuse if MIME matches the decoder's supported input.
+                if mime == "image/jpeg" and isinstance(self._decoder, SoftDecoder):
+                    return self._decoder
+                if mime == "video/h264" and isinstance(self._decoder, (PyAVH264Decoder, FFmpegHwDecoder)):
+                    return self._decoder
+                self._release_decoder_unsafe()
+            if mime == "image/jpeg":
+                self._decoder = SoftDecoder()
+                self.decoder_text = "CPU"
+            elif mime == "video/h264":
+                if self._use_hw:
+                    try:
+                        self._decoder = FFmpegHwDecoder(self._hwaccel, self._width, self._height, self._fps)
+                        self.decoder_text = f"HW {self._hwaccel.upper()}"
+                    except Exception:
+                        self._decoder = PyAVH264Decoder()
+                        self.decoder_text = "CPU (fallback)"
+                else:
+                    self._decoder = PyAVH264Decoder()
+                    self.decoder_text = "CPU"
+            else:
+                return None
+            return self._decoder
 
     # -- streaming ---------------------------------------------------------
     def start(self):
@@ -476,17 +553,21 @@ class Bridge:
         try:
             sock.settimeout(10)
             reader = MjpegFrameReader()
-            self._status(f"Streaming {self._width}x{self._height} -> BestCam driver")
+            self._status(f"Streaming {self._width}x{self._height} [{self._codec}] -> BestCam driver")
             while not self._stop.is_set():
-                jpeg = reader.read_frame()
-                if jpeg is None:
+                frame = reader.read_frame()
+                if frame is None:
                     chunk = sock.recv(65536)
                     if not chunk:
                         raise ConnectionError("connection closed")
                     reader.feed(chunk)
                     continue
 
-                bgr = cv2.imdecode(np.frombuffer(jpeg, dtype=np.uint8), cv2.IMREAD_COLOR)
+                jpeg, mime = frame
+                decoder = self._decoder_for(mime)
+                if decoder is None:
+                    continue
+                bgr = decoder.decode(jpeg, mime)
                 if bgr is None:
                     continue
                 if bgr.shape[1] != self._width or bgr.shape[0] != self._height:
@@ -496,6 +577,7 @@ class Bridge:
             sock.close()
             if self._sock is sock:
                 self._sock = None
+            self._release_decoder()
 
     def _letterbox(self, bgr):
         """Fit the source into the negotiated output preserving aspect ratio
@@ -557,20 +639,22 @@ def main():
 
     root = tk.Tk()
     root.title("BestCam Bridge")
-    root.geometry("320x200")
+    root.geometry("320x240")
     root.resizable(False, False)
 
     status_var = tk.StringVar(value="Idle")
     res_var = tk.StringVar(value="1920x1080")
     fps_var = tk.StringVar(value="FPS: 0")
+    dec_var = tk.StringVar(value="Decoder: CPU")
 
     bridge = Bridge()
 
     def update_ui():
         status_var.set(bridge.status_text)
         w, h = bridge.resolution
-        res_var.set(f"{w}x{h}")
+        res_var.set(f"{w}x{h} ({bridge.codec.upper()})")
         fps_var.set(f"FPS: {bridge.fps:.1f}")
+        dec_var.set(f"Decoder: {bridge.decoder_text}")
         try:
             icon.title = f"BestCam Bridge — {bridge.status_text}"
         except Exception:
@@ -586,28 +670,55 @@ def main():
     def restart_adb():
         bridge.restart_adb()  # async, never freezes the UI
 
-    def set_res(w, h, fps=None):
-        bridge.set_resolution(w, h, fps)
+    def set_res(w, h, fps=None, codec=None):
+        bridge.set_resolution(w, h, fps, codec)
         root.after(0, update_ui)
 
-    def res_action(w, h, fps):
-        # pystray rejects lambdas with default args; use a closure factory
-        return lambda icon, item: set_res(w, h, fps)
+    def res_action(w, h, fps, codec):
+        return lambda icon, item: set_res(w, h, fps, codec)
 
     def res_checked(w, h):
         return lambda item: bridge.resolution == (w, h)
 
     def build_res_menu(item=None):
-        # Conditional options straight from the phone's capability table;
-        # only combinations the phone can actually sustain are offered.
+        # Conditional options straight from the phone's capability table.
+        # Group by resolution and prefer H.264 if the phone offers it.
         caps = bridge.capabilities
+        grouped = {}
+        for c in caps:
+            w, h, fps, enc, codec = c
+            key = (w, h)
+            if key not in grouped:
+                grouped[key] = c
+            else:
+                # Prefer H.264 over MJPEG for the same resolution.
+                if codec.lower() == "h264":
+                    grouped[key] = c
         items = []
-        for (w, h, fps, enc) in caps:
-            label = f"{w}x{h} @ {fps} fps"
-            items.append(MenuItem(label, res_action(w, h, fps),
+        for (w, h), c in sorted(grouped.items(), key=lambda x: x[0][0] * x[0][1]):
+            label = f"{w}x{h} @ {c[2]} fps ({c[4].upper()})"
+            items.append(MenuItem(label, res_action(w, h, c[2], c[4]),
                                   checked=res_checked(w, h)))
         if not items:
             items.append(MenuItem("(phone offline)", None, enabled=False))
+        return Menu(*items)
+
+    def set_hwaccel(hwaccel: str):
+        bridge.set_hwaccel(hwaccel)
+        root.after(0, update_ui)
+
+    def hw_action(hwaccel: str):
+        return lambda icon, item: set_hwaccel(hwaccel)
+
+    def hw_checked(hwaccel: str):
+        return lambda item: bridge._hwaccel == hwaccel
+
+    def build_dec_menu(item=None):
+        items = [MenuItem("CPU (software)", hw_action("cpu"), checked=hw_checked("cpu"))]
+        for dev in list_hw_devices():
+            name = dev["name"]
+            label = dev["label"]
+            items.append(MenuItem(label, hw_action(name), checked=hw_checked(name)))
         return Menu(*items)
 
     def on_quit(icon=None, item=None):
@@ -621,21 +732,23 @@ def main():
     tk.Label(root, textvariable=status_var, font=("Segoe UI", 11)).pack(pady=8)
     tk.Label(root, textvariable=res_var, font=("Segoe UI", 9)).pack()
     tk.Label(root, textvariable=fps_var, font=("Segoe UI", 9)).pack()
+    tk.Label(root, textvariable=dec_var, font=("Segoe UI", 9)).pack()
     btn_row = tk.Frame(root)
     btn_row.pack(pady=10)
     tk.Button(btn_row, text="Start", width=8, command=start).pack(side="left", padx=4)
     tk.Button(btn_row, text="Stop", width=8, command=stop).pack(side="left", padx=4)
     tk.Button(btn_row, text="Restart ADB", width=12, command=restart_adb).pack(side="left", padx=4)
 
-    # Dynamic submenu: rebuilt on open, so the phone's capability table is
+    # Dynamic submenus: rebuilt on open, so the phone's capability table is
     # always current.
     menu = pystray.Menu(
         MenuItem("Show Window", lambda icon, item: root.deiconify(), default=True),
         MenuItem("Start", lambda icon, item: start(), enabled=lambda item: not bridge.running),
         MenuItem("Stop", lambda icon, item: stop(), enabled=lambda item: bridge.running),
-        MenuItem("Resolution", submenu=build_res_menu),
+        MenuItem("Resolution", Menu(build_res_menu)),
+        MenuItem("Decoder Device", Menu(build_dec_menu)),
         MenuItem("Restart ADB", lambda icon, item: restart_adb()),
-        Menu.SEPARATOR,
+        pystray.Menu.SEPARATOR,
         MenuItem("Quit", on_quit),
     )
     icon = pystray.Icon("BestCam", _make_icon(), "BestCam Bridge", menu)

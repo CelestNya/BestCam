@@ -47,8 +47,11 @@ import time
 import cv2
 import numpy as np
 
+from decoder import PyAVH264Decoder, SoftDecoder
+
 target_w = int(os.environ.get("BESTCAM_WIDTH", "1920"))
 target_h = int(os.environ.get("BESTCAM_HEIGHT", "1080"))
+target_codec = os.environ.get("BESTCAM_CODEC", "h264").lower()
 ADB = os.environ.get("BESTCAM_ADB", "adb")
 
 SHARED_MEM_NAME = "Global\\BestCam_SharedMem"
@@ -225,6 +228,7 @@ class MjpegFrameReader:
         self._buf += data
 
     def read_frame(self):
+        """Return (frame_bytes, content_type) or None."""
         while True:
             # 1) 上限保护：超限从下一个 boundary 重新同步（丢弃垃圾）
             if len(self._buf) > self.MAX_BUFFER:
@@ -252,15 +256,17 @@ class MjpegFrameReader:
                 del self._buf[:1]
                 continue
 
-            # 4) 解析 Content-Length；无法确定帧长则跳过该头继续找
+            # 4) 解析 Content-Length 与 Content-Type；无法确定帧长则跳过该头
             cl = None
+            mime = "image/jpeg"
             for line in self._buf[0:h_end].split(b"\r\n"):
                 if line.lower().startswith(b"content-length:"):
                     try:
                         cl = int(line.split(b":", 1)[1].strip())
                     except ValueError:
                         cl = None
-                    break
+                elif line.lower().startswith(b"content-type:"):
+                    mime = line.split(b":", 1)[1].strip().decode("ascii", "ignore")
             if cl is None or cl <= 0 or cl > self.MAX_JPEG:
                 del self._buf[:h_end + 4]
                 continue
@@ -272,20 +278,26 @@ class MjpegFrameReader:
             jpeg = bytes(self._buf[jpeg_start:jpeg_start + cl])
             del self._buf[:jpeg_start + cl]
 
-            # 6) EOI 校验：JPEG 必须以 0xFFD9 结束，坏帧丢弃继续同步
-            if len(jpeg) < 4 or jpeg[-2:] != b"\xff\xd9":
+            # 6) 格式校验：JPEG 必须以 0xFFD9 结束；H.264 直接放行
+            if mime == "image/jpeg" and (len(jpeg) < 4 or jpeg[-2:] != b"\xff\xd9"):
                 continue
-            return jpeg
+            return jpeg, mime
 
 
 def main():
-    print(f"BestCam companion: target {target_w}x{target_h}, mapping {TOTAL_SIZE} bytes")
+    print(f"BestCam companion: target {target_w}x{target_h} [{target_codec.upper()}], mapping {TOTAL_SIZE} bytes")
 
     # ADB forward
     subprocess.run([ADB, "forward", f"tcp:{PORT}", f"tcp:{PORT}"], check=False, capture_output=True)
 
     writer = SharedMemWriter()
     print("Shared memory connected. Waiting for phone stream...")
+
+    decoder = None
+    if target_codec == "h264":
+        decoder = PyAVH264Decoder()
+    else:
+        decoder = SoftDecoder()
 
     while True:
         sock = None
@@ -294,7 +306,7 @@ def main():
             # (best-effort; the phone picks its closest supported option).
             try:
                 with socket.create_connection(("127.0.0.1", 8081), timeout=5) as ctl:
-                    ctl.sendall(f"set_resolution {target_w} {target_h} 0\r\n".encode())
+                    ctl.sendall(f"set_resolution {target_w} {target_h} 0 {target_codec}\r\n".encode())
                     ctl.settimeout(5)
                     ctl.recv(64)
             except OSError:
@@ -305,15 +317,16 @@ def main():
             print("Stream connected. Pushing NV12 frames to shared memory.")
             canvas = None
             while True:
-                jpeg = reader.read_frame()
-                if jpeg is None:
+                frame = reader.read_frame()
+                if frame is None:
                     chunk = sock.recv(65536)
                     if not chunk:
                         raise ConnectionError("connection closed")
                     reader.feed(chunk)
                     continue
 
-                bgr = cv2.imdecode(np.frombuffer(jpeg, dtype=np.uint8), cv2.IMREAD_COLOR)
+                data, mime = frame
+                bgr = decoder.decode(data, mime)
                 if bgr is None:
                     continue
                 if bgr.shape[1] != target_w or bgr.shape[0] != target_h:
