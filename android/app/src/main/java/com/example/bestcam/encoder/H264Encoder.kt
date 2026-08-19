@@ -50,14 +50,17 @@ class H264Encoder(
     }
 
     override fun encode(yuv: ByteArray, width: Int, height: Int): EncodedFrame? {
-        if (released || width != this.width || height != this.height) return null
+        if (released || width != this.width || height != this.height) {
+            Log.w("H264Encoder", "encode skipped: released=$released size=${width}x$height expected=${this.width}x${this.height}")
+            return null
+        }
 
         // Convert NV21 -> NV12 in-place (swap U/V pairs in the chroma plane).
         nv21ToNv12(yuv, nv12SwapBuf)
 
         val inputIndex = codecInstance.dequeueInputBuffer(10_000)
         if (inputIndex < 0) {
-            Log.w("H264Encoder", "no input buffer available")
+            Log.w("H264Encoder", "no input buffer available, draining")
             return drainOne()
         }
         val inputBuffer = codecInstance.getInputBuffer(inputIndex) ?: return drainOne()
@@ -68,7 +71,13 @@ class H264Encoder(
         )
         presentationTimeUs += presentationStep
 
-        return drainOne()
+        val out = drainOne()
+        if (out == null) {
+            Log.d("H264Encoder", "no output for queued input (pts=$presentationTimeUs)")
+        } else {
+            Log.d("H264Encoder", "output ${out.data.size} bytes key=${out.isKeyFrame}")
+        }
+        return out
     }
 
     override fun release() {
@@ -100,10 +109,17 @@ class H264Encoder(
                 EncodedFrame(data, codec, key)
             }
             outIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> {
-                // New format is ready; no data this round, try again.
+                Log.d("H264Encoder", "output format changed: ${codecInstance.outputFormat}")
                 drainOne()
             }
-            else -> null
+            outIndex == MediaCodec.INFO_TRY_AGAIN_LATER -> {
+                Log.d("H264Encoder", "output not ready")
+                null
+            }
+            else -> {
+                Log.w("H264Encoder", "unexpected dequeueOutputBuffer result: $outIndex")
+                null
+            }
         }
     }
 
