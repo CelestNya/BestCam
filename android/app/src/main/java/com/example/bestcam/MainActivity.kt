@@ -25,7 +25,7 @@ class MainActivity : AppCompatActivity() {
     private var cameraManager: CameraManager? = null
     private var isStreaming = false
     private var isBeautyOn = false
-    private var isHwEncode = false
+    private var isHwEncode = true  // default ON; falls back to JPEG if H.264 init fails
 
     private val handler = Handler(Looper.getMainLooper())
     private val updateStatsTask = object : Runnable {
@@ -91,8 +91,8 @@ class MainActivity : AppCompatActivity() {
         server?.start()
         cameraManager = CameraManager(this, this, binding.previewView, server!!)
         server?.capabilityProvider = { cameraManager?.probeCapabilities().orEmpty() }
-        server?.resolutionListener = { w, h, fps ->
-            cameraManager?.setStreamConfig(w, h, fps)
+        server?.resolutionListener = { w, h, fps, codec ->
+            cameraManager?.setStreamConfig(w, h, fps, codec)
         }
 
         // Apply default resolution (companion is the authority; the phone only

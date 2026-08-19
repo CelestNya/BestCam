@@ -33,12 +33,13 @@ class H264Encoder(
     private var presentationTimeUs = 0L
     private var released = false
     private val nv12SwapBuf = ByteArray(width * height * 3 / 2)
+    private var spsPps: ByteArray? = null
 
     init {
         val format = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, width, height).apply {
             setInteger(MediaFormat.KEY_BIT_RATE, bitRate)
             setInteger(MediaFormat.KEY_FRAME_RATE, fps)
-            setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 2) // seconds
+            setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 0) // every frame is a key frame (low-latency webcam)
             setInteger(
                 MediaFormat.KEY_COLOR_FORMAT,
                 MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420SemiPlanar
@@ -106,10 +107,32 @@ class H264Encoder(
                 buf.get(data)
                 codecInstance.releaseOutputBuffer(outIndex, false)
                 val key = (bufferInfo.flags and MediaCodec.BUFFER_FLAG_KEY_FRAME) != 0
-                EncodedFrame(data, codec, key)
+                // Prepend SPS/PPS so mid-stream clients can decode any key frame.
+                val sps = spsPps
+                val out = if (key && sps != null) {
+                    sps + data
+                } else {
+                    data
+                }
+                EncodedFrame(out, codec, key)
             }
             outIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> {
-                Log.d("H264Encoder", "output format changed: ${codecInstance.outputFormat}")
+                val fmt = codecInstance.outputFormat
+                val sps = fmt.getByteBuffer("csd-0")
+                val pps = fmt.getByteBuffer("csd-1")
+                val out = java.io.ByteArrayOutputStream()
+                if (sps != null) {
+                    val b = ByteArray(sps.remaining())
+                    sps.get(b)
+                    out.write(b)
+                }
+                if (pps != null) {
+                    val b = ByteArray(pps.remaining())
+                    pps.get(b)
+                    out.write(b)
+                }
+                spsPps = out.toByteArray()
+                Log.d("H264Encoder", "captured sps/pps ${spsPps?.size} bytes")
                 drainOne()
             }
             outIndex == MediaCodec.INFO_TRY_AGAIN_LATER -> {
