@@ -28,6 +28,11 @@ class MjpegServer(private val port: Int = 8080) {
     private val lock = ReentrantLock()
     private val frameCondition = lock.newCondition()
 
+    // Control channel hooks (wired up by MainActivity)
+    var capabilityProvider: (() -> List<Capability>)? = null
+    var resolutionListener: ((w: Int, h: Int, fps: Int) -> Unit)? = null
+    private var controlSocket: ServerSocket? = null
+
     fun start() {
         if (isRunning) return
         isRunning = true
@@ -51,6 +56,79 @@ class MjpegServer(private val port: Int = 8080) {
         executor.execute {
             sendLoop()
         }
+
+        // Control channel on 8081: capability handshake + set_resolution.
+        executor.execute {
+            try {
+                controlSocket = ServerSocket(8081)
+                Log.d("MjpegServer", "Control server started on port 8081")
+                while (isRunning) {
+                    val socket = controlSocket?.accept() ?: break
+                    handleControlClient(socket)
+                }
+            } catch (e: IOException) {
+                Log.e("MjpegServer", "Control server error", e)
+            }
+        }
+    }
+
+    private fun handleControlClient(socket: Socket) {
+        executor.execute {
+            try {
+                socket.tcpNoDelay = true
+                socket.soTimeout = 5000
+                val input = socket.getInputStream().bufferedReader()
+                val output = socket.getOutputStream()
+                val line = input.readLine() ?: return@execute
+                Log.d("MjpegServer", "control cmd: $line")
+                when {
+                    line.startsWith("GET /capabilities") -> {
+                        val caps = capabilityProvider?.invoke().orEmpty()
+                        val sb = StringBuilder("HTTP/1.1 200 OK\r\n")
+                        sb.append("Content-Type: application/json\r\n\r\n")
+                        sb.append(capsToJson(caps))
+                        output.write(sb.toString().toByteArray())
+                        output.flush()
+                    }
+                    line.startsWith("set_resolution") -> {
+                        val parts = line.trim().split(Regex("\\s+"))
+                        if (parts.size >= 4) {
+                            val w = parts[1].toIntOrNull()
+                            val h = parts[2].toIntOrNull()
+                            val fps = parts[3].toIntOrNull()
+                            if (w != null && h != null && fps != null) {
+                                resolutionListener?.invoke(w, h, fps)
+                                Log.d("MjpegServer", "set_resolution ${w}x$h @ $fps")
+                            }
+                        }
+                        output.write("OK\r\n".toByteArray())
+                        output.flush()
+                    }
+                    else -> {
+                        output.write("UNKNOWN\r\n".toByteArray())
+                        output.flush()
+                    }
+                }
+                socket.close()
+            } catch (e: Exception) {
+                Log.d("MjpegServer", "control client error", e)
+                try { socket.close() } catch (ignore: Exception) {}
+            }
+        }
+    }
+
+    private fun capsToJson(caps: List<Capability>): String {
+        val sb = StringBuilder("{\"resolutions\":[")
+        caps.forEachIndexed { i, c ->
+            if (i > 0) sb.append(',')
+            sb.append("{\"w\":").append(c.w)
+                .append(",\"h\":").append(c.h)
+                .append(",\"max_fps\":").append(c.maxFps)
+                .append(",\"encode_ms\":").append(c.encodeMs)
+                .append('}')
+        }
+        sb.append("]}")
+        return sb.toString()
     }
 
     private fun handleNewClient(socket: Socket) {
@@ -152,5 +230,7 @@ class MjpegServer(private val port: Int = 8080) {
         clientStreams.clear()
         try { serverSocket?.close() } catch (ignore: Exception) {}
         serverSocket = null
+        try { controlSocket?.close() } catch (ignore: Exception) {}
+        controlSocket = null
     }
 }

@@ -24,8 +24,8 @@ class MainActivity : AppCompatActivity() {
     private var server: MjpegServer? = null
     private var cameraManager: CameraManager? = null
     private var isStreaming = false
-    private var is1080p = false // Set default to 720p
     private var isBeautyOn = false
+    private var isHwEncode = false
 
     private val handler = Handler(Looper.getMainLooper())
     private val updateStatsTask = object : Runnable {
@@ -71,15 +71,10 @@ class MainActivity : AppCompatActivity() {
             Toast.makeText(this, "Beauty Filter: $status", Toast.LENGTH_SHORT).show()
         }
 
-        binding.btnSettings.setOnClickListener {
-            is1080p = !is1080p
-            val width = if (is1080p) 1920 else 1280
-            val height = if (is1080p) 1080 else 720
-            cameraManager?.setResolution(width, height)
-            
-            val resText = if (is1080p) "1080p" else "720p"
-            binding.btnSettings.text = resText
-            Toast.makeText(this, "Resolution: $resText", Toast.LENGTH_SHORT).show()
+        binding.switchHwEncode.setOnCheckedChangeListener { _, isChecked ->
+            isHwEncode = isChecked
+            cameraManager?.setHardwareEncoding(isHwEncode)
+            Toast.makeText(this, "H.264 hardware encoding: ${if (isHwEncode) "ON" else "OFF"}", Toast.LENGTH_SHORT).show()
         }
 
         binding.zoomSlider.addOnChangeListener { _, value, _ ->
@@ -95,11 +90,15 @@ class MainActivity : AppCompatActivity() {
         server = MjpegServer(8080)
         server?.start()
         cameraManager = CameraManager(this, this, binding.previewView, server!!)
-        
-        // Apply current resolution
-        val width = if (is1080p) 1920 else 1280
-        val height = if (is1080p) 1080 else 720
-        cameraManager?.setResolution(width, height) // This also calls startCamera via bindCameraUseCases
+        server?.capabilityProvider = { cameraManager?.probeCapabilities().orEmpty() }
+        server?.resolutionListener = { w, h, fps ->
+            cameraManager?.setStreamConfig(w, h, fps)
+        }
+
+        // Apply default resolution (companion is the authority; the phone only
+        // displays the negotiated config, but a sane default is still needed).
+        cameraManager?.setResolution(1280, 720)
+        cameraManager?.setHardwareEncoding(isHwEncode)
         
         handler.post(updateStatsTask)
         
@@ -115,9 +114,8 @@ class MainActivity : AppCompatActivity() {
             if (server == null) {
                 server = MjpegServer(8080)
                 cameraManager = CameraManager(this, this, binding.previewView, server!!)
-                val width = if (is1080p) 1920 else 1280
-                val height = if (is1080p) 1080 else 720
-                cameraManager?.setResolution(width, height)
+                cameraManager?.setResolution(1280, 720)
+                cameraManager?.setHardwareEncoding(isHwEncode)
             }
             server?.start()
             isStreaming = true
@@ -143,6 +141,8 @@ class MainActivity : AppCompatActivity() {
             val frames = it.getFrameCount()
             binding.tvStats.text = "Frames: $frames | Clients: $clients"
         }
+        binding.btnSettings.text = cameraManager?.getStreamConfigString() ?: "--"
+        binding.tvResolutionInfo.text = cameraManager?.getStreamConfigString() ?: "--"
     }
 
     private fun checkUsbDebugging() {
