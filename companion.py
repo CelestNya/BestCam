@@ -201,24 +201,81 @@ def bgr_to_nv12(bgr: np.ndarray) -> np.ndarray:
     return nv12
 
 
-def recv_http_headers(sock: socket.socket) -> bytes:
-    data = b""
-    while b"\r\n\r\n" not in data:
-        chunk = sock.recv(4096)
-        if not chunk:
-            raise ConnectionError("connection closed while reading headers")
-        data += chunk
-    return data
+class MjpegFrameReader:
+    """MJPEG multipart 帧读取器。
 
+    以 --boundary 帧边界定位 + Content-Length 精确取帧，免疫：
+      - JPEG 体内假 SOI (0xFFD8) 导致的解析错位
+      - 头部残缺 / 缺 Content-Length 时旧实现的缓冲无界增长（SOI 永远停
+        在偏移 0，死循环直至内存耗尽）
+    缓冲超过 MAX_BUFFER 时从下一个 boundary 重同步，保证内存有界。
 
-def recv_exact(sock: socket.socket, n: int) -> bytes:
-    buf = b""
-    while len(buf) < n:
-        chunk = sock.recv(n - len(buf))
-        if not chunk:
-            raise ConnectionError("connection closed")
-        buf += chunk
-    return buf
+    read_frame() 返回完整 JPEG；数据不足返回 None（调用方继续 recv 后重试）；
+    流不可恢复时抛 ConnectionError。
+    """
+
+    BOUNDARY = b"--boundary"
+    MAX_BUFFER = 16 * 1024 * 1024
+    MAX_JPEG = 8 * 1024 * 1024
+
+    def __init__(self):
+        self._buf = bytearray()
+
+    def feed(self, data: bytes):
+        self._buf += data
+
+    def read_frame(self):
+        while True:
+            # 1) 上限保护：超限从下一个 boundary 重新同步（丢弃垃圾）
+            if len(self._buf) > self.MAX_BUFFER:
+                i = self._buf.find(self.BOUNDARY)
+                if i < 0:
+                    self._buf.clear()
+                    return None
+                del self._buf[:i]
+                continue
+
+            # 2) 定位帧头 boundary；之前的垃圾（含 HTTP 握手头）一并丢弃
+            b = self._buf.find(self.BOUNDARY)
+            if b < 0:
+                return None  # 数据不足，等调用方 recv
+            if b > 0:
+                del self._buf[:b]
+                b = 0
+
+            # 3) 找头部结束 \r\n\r\n
+            h_end = self._buf.find(b"\r\n\r\n", 0)
+            if h_end < 0:
+                return None
+            if h_end > 4096:
+                # 假 boundary（头异常大）：丢掉一个字节继续找真边界
+                del self._buf[:1]
+                continue
+
+            # 4) 解析 Content-Length；无法确定帧长则跳过该头继续找
+            cl = None
+            for line in self._buf[0:h_end].split(b"\r\n"):
+                if line.lower().startswith(b"content-length:"):
+                    try:
+                        cl = int(line.split(b":", 1)[1].strip())
+                    except ValueError:
+                        cl = None
+                    break
+            if cl is None or cl <= 0 or cl > self.MAX_JPEG:
+                del self._buf[:h_end + 4]
+                continue
+
+            # 5) 等待完整帧体
+            jpeg_start = h_end + 4
+            if len(self._buf) < jpeg_start + cl:
+                return None
+            jpeg = bytes(self._buf[jpeg_start:jpeg_start + cl])
+            del self._buf[:jpeg_start + cl]
+
+            # 6) EOI 校验：JPEG 必须以 0xFFD9 结束，坏帧丢弃继续同步
+            if len(jpeg) < 4 or jpeg[-2:] != b"\xff\xd9":
+                continue
+            return jpeg
 
 
 def main():
@@ -230,56 +287,59 @@ def main():
     writer = SharedMemWriter()
     print("Shared memory connected. Waiting for phone stream...")
 
-    frame_counter = 0
     while True:
+        sock = None
         try:
+            # Sync the phone to our target resolution over the control channel
+            # (best-effort; the phone picks its closest supported option).
+            try:
+                with socket.create_connection(("127.0.0.1", 8081), timeout=5) as ctl:
+                    ctl.sendall(f"set_resolution {target_w} {target_h} 0\r\n".encode())
+                    ctl.settimeout(5)
+                    ctl.recv(64)
+            except OSError:
+                pass
             sock = socket.create_connection(("127.0.0.1", PORT), timeout=5)
-            # consume the multipart head until the first image boundary
-            first = sock.recv(4096)
-            while b"\r\n\r\n" not in first:
-                first += sock.recv(4096)
-            # first frame data follows; loop below reads subsequent parts
-            pending = first.split(b"\r\n\r\n", 1)[1]
             sock.settimeout(10)
+            reader = MjpegFrameReader()
             print("Stream connected. Pushing NV12 frames to shared memory.")
+            canvas = None
             while True:
-                if len(pending) < 4:
-                    pending += recv_exact(sock, 4 - len(pending))
-                # find SOI marker (0xFFD8) and Content-Length from headers
-                # MJPEG parts: headers then JPEG; we simply scan for SOI..EOI
-                soi = pending.find(b"\xff\xd8")
-                if soi < 0:
-                    pending += recv_exact(sock, 4096)
+                jpeg = reader.read_frame()
+                if jpeg is None:
+                    chunk = sock.recv(65536)
+                    if not chunk:
+                        raise ConnectionError("connection closed")
+                    reader.feed(chunk)
                     continue
-                # headers before SOI contain Content-Length of the JPEG body
-                head = pending[:soi]
-                cl = None
-                for line in head.split(b"\r\n"):
-                    if line.lower().startswith(b"content-length:"):
-                        cl = int(line.split(b":")[1].strip())
-                if cl is None:
-                    pending = pending[soi:] + recv_exact(sock, 4096)
-                    continue
-                # wait for a full JPEG body
-                while len(pending) - soi < cl:
-                    pending += recv_exact(sock, 4096)
-                jpeg = pending[soi: soi + cl]
-                pending = pending[soi + cl:]
 
                 bgr = cv2.imdecode(np.frombuffer(jpeg, dtype=np.uint8), cv2.IMREAD_COLOR)
                 if bgr is None:
                     continue
                 if bgr.shape[1] != target_w or bgr.shape[0] != target_h:
-                    bgr = cv2.resize(bgr, (target_w, target_h), interpolation=cv2.INTER_AREA)
+                    # letterbox: preserve aspect ratio, never stretch
+                    sw, sh = bgr.shape[1], bgr.shape[0]
+                    scale = min(target_w / sw, target_h / sh)
+                    nw, nh = max(1, round(sw * scale)), max(1, round(sh * scale))
+                    resized = cv2.resize(
+                        bgr, (nw, nh),
+                        interpolation=cv2.INTER_AREA if scale < 1.0 else cv2.INTER_LINEAR)
+                    if canvas is None or canvas.shape[:2] != (target_h, target_w):
+                        canvas = np.zeros((target_h, target_w, 3), dtype=np.uint8)
+                    canvas[:] = 0
+                    x0, y0 = (target_w - nw) // 2, (target_h - nh) // 2
+                    canvas[y0:y0 + nh, x0:x0 + nw] = resized
+                    bgr = canvas
                 writer.write(bgr_to_nv12(bgr))
         except (ConnectionError, ConnectionRefusedError, socket.timeout, OSError) as exc:
             print(f"Stream error: {exc}. Reconnecting in 2 s...")
             time.sleep(2)
         finally:
-            try:
-                sock.close()
-            except Exception:
-                pass
+            if sock is not None:
+                try:
+                    sock.close()
+                except Exception:
+                    pass
 
 
 if __name__ == "__main__":

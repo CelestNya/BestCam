@@ -29,7 +29,9 @@ DATA_OFFSET = 32      # NV12 frame data starts after the full 32-byte header
 MAX_W, MAX_H = 1920, 1080
 TOTAL_SIZE = 32 + MAX_W * MAX_H * 3 // 2
 PORT = 8080
+CONTROL_PORT = 8081   # phone control channel: capabilities handshake + set_resolution
 RESOLUTIONS = [(640, 480), (800, 450), (800, 600), (1280, 720), (1920, 1080)]
+MAX_CAP_AGE = 30.0    # seconds after which the capability table is re-fetched
 
 
 class _SECURITY_DESCRIPTOR(ctypes.Structure):
@@ -70,6 +72,83 @@ def _make_icon():
     return img
 
 
+class MjpegFrameReader:
+    """MJPEG multipart 帧读取器。
+
+    以 --boundary 帧边界定位 + Content-Length 精确取帧，免疫：
+      - JPEG 体内假 SOI (0xFFD8) 导致的解析错位
+      - 头部残缺 / 缺 Content-Length 时旧实现的缓冲无界增长（SOI 永远停
+        在偏移 0，死循环直至内存耗尽）
+    缓冲超过 MAX_BUFFER 时从下一个 boundary 重同步，保证内存有界。
+
+    read_frame() 返回完整 JPEG；数据不足返回 None（调用方继续 recv 后重试）；
+    流不可恢复时抛 ConnectionError。
+    """
+
+    BOUNDARY = b"--boundary"
+    MAX_BUFFER = 16 * 1024 * 1024
+    MAX_JPEG = 8 * 1024 * 1024
+
+    def __init__(self):
+        self._buf = bytearray()
+
+    def feed(self, data: bytes):
+        self._buf += data
+
+    def read_frame(self):
+        while True:
+            # 1) 上限保护：超限从下一个 boundary 重新同步（丢弃垃圾）
+            if len(self._buf) > self.MAX_BUFFER:
+                i = self._buf.find(self.BOUNDARY)
+                if i < 0:
+                    self._buf.clear()
+                    return None
+                del self._buf[:i]
+                continue
+
+            # 2) 定位帧头 boundary；之前的垃圾（含 HTTP 握手头）一并丢弃
+            b = self._buf.find(self.BOUNDARY)
+            if b < 0:
+                return None  # 数据不足，等调用方 recv
+            if b > 0:
+                del self._buf[:b]
+                b = 0
+
+            # 3) 找头部结束 \r\n\r\n
+            h_end = self._buf.find(b"\r\n\r\n", 0)
+            if h_end < 0:
+                return None
+            if h_end > 4096:
+                # 假 boundary（头异常大）：丢掉一个字节继续找真边界
+                del self._buf[:1]
+                continue
+
+            # 4) 解析 Content-Length；无法确定帧长则跳过该头继续找
+            cl = None
+            for line in self._buf[0:h_end].split(b"\r\n"):
+                if line.lower().startswith(b"content-length:"):
+                    try:
+                        cl = int(line.split(b":", 1)[1].strip())
+                    except ValueError:
+                        cl = None
+                    break
+            if cl is None or cl <= 0 or cl > self.MAX_JPEG:
+                del self._buf[:h_end + 4]
+                continue
+
+            # 5) 等待完整帧体
+            jpeg_start = h_end + 4
+            if len(self._buf) < jpeg_start + cl:
+                return None
+            jpeg = bytes(self._buf[jpeg_start:jpeg_start + cl])
+            del self._buf[:jpeg_start + cl]
+
+            # 6) EOI 校验：JPEG 必须以 0xFFD9 结束，坏帧丢弃继续同步
+            if len(jpeg) < 4 or jpeg[-2:] != b"\xff\xd9":
+                continue
+            return jpeg
+
+
 class Bridge:
     """Streaming core: ADB forward + MJPEG receive + NV12 -> shared memory.
 
@@ -83,8 +162,15 @@ class Bridge:
     def __init__(self, width=1920, height=1080, on_status=None):
         self._width = width
         self._height = height
+        self._fps = 30
         self._frame_size = width * height * 3 // 2
         self._on_status = on_status
+        # Phone capability table: list of (w, h, max_fps, encode_ms) as
+        # reported by the phone's control channel. The tray menu only offers
+        # these combinations (conditional options), and the driver advertises
+        # exactly the current one.
+        self._caps = []
+        self._caps_t0 = 0.0
         self._k32 = ctypes.WinDLL("kernel32", use_last_error=True)
         # Explicit signatures: without them ctypes truncates 64-bit handles
         # and pointers to 32-bit ints on x64.
@@ -168,14 +254,20 @@ class Bridge:
         sa.lpSecurityDescriptor = ctypes.cast(ctypes.byref(sd), ctypes.c_void_p).value
         return sa, sd
 
-    def set_resolution(self, width, height):
-        """Switch output resolution manually; the client must request the same
+    def set_resolution(self, width, height, fps=None):
+        """Switch output resolution; the client must request the same
         size (ExVR/OBS setting or re-open), otherwise frames stay black."""
+        if fps is None:
+            cap = self._find_cap(width, height)
+            fps = cap[2] if cap else self._fps
+        self._send_control(f"set_resolution {width} {height} {fps}")
         if (width, height) == (self._width, self._height):
+            self._fps = fps
             return
         running = self.running
         self.stop()
         self._width, self._height = width, height
+        self._fps = fps
         self._frame_size = width * height * 3 // 2
         if running:
             # The old thread may still be alive (recv shutdown takes a
@@ -185,6 +277,63 @@ class Bridge:
             while self._thread is not None and self._thread.is_alive() and time.time() < deadline:
                 time.sleep(0.05)
             self.start()
+
+    # -- phone capability table -------------------------------------------
+    @property
+    def capabilities(self):
+        """Cached capability table, re-fetched when stale or empty."""
+        now = time.time()
+        if (self._caps and now - self._caps_t0 < MAX_CAP_AGE) or self._stop.is_set():
+            return self._caps
+        try:
+            self._caps = self._fetch_capabilities()
+            self._caps_t0 = now
+        except OSError:
+            pass  # phone/ADB temporarily unreachable; keep the last table
+        return self._caps
+
+    def _fetch_capabilities(self):
+        """GET /capabilities on the phone's control channel; parse JSON."""
+        import json
+        with socket.create_connection(("127.0.0.1", CONTROL_PORT), timeout=5) as s:
+            s.sendall(b"GET /capabilities HTTP/1.1\r\n\r\n")
+            data = b""
+            while True:
+                chunk = s.recv(4096)
+                if not chunk:
+                    break
+                data += chunk
+        body = data.split(b"\r\n\r\n", 1)[-1]
+        caps = []
+        try:
+            for r in json.loads(body).get("resolutions", []):
+                caps.append((int(r["w"]), int(r["h"]), int(r["max_fps"]), int(r.get("encode_ms", 0))))
+        except (ValueError, TypeError, KeyError):
+            pass
+        return caps
+
+    def _send_control(self, cmd):
+        """Fire a control command at the phone; best-effort (no raise)."""
+        try:
+            with socket.create_connection(("127.0.0.1", CONTROL_PORT), timeout=5) as s:
+                s.sendall(cmd.encode() + b"\r\n")
+                s.settimeout(5)
+                s.recv(64)
+        except OSError:
+            pass
+
+    def _find_cap(self, width, height):
+        """Best capability for (w,h): exact match, else same aspect, else closest."""
+        caps = self.capabilities
+        if not caps:
+            return None
+        for c in caps:
+            if c[0] == width and c[1] == height:
+                return c
+        for c in caps:
+            if c[0] * height == c[1] * width:
+                return c
+        return min(caps, key=lambda c: abs(c[0] * c[1] - width * height))
 
     @property
     def running(self):
@@ -325,52 +474,48 @@ class Bridge:
         sock = socket.create_connection(("127.0.0.1", PORT), timeout=5)
         self._sock = sock
         try:
-            first = sock.recv(4096)
-            while b"\r\n\r\n" not in first:
-                first += sock.recv(4096)
-            pending = first.split(b"\r\n\r\n", 1)[1]
             sock.settimeout(10)
+            reader = MjpegFrameReader()
             self._status(f"Streaming {self._width}x{self._height} -> BestCam driver")
             while not self._stop.is_set():
-                if len(pending) < 4:
-                    pending += self._recv_exact(sock, 4 - len(pending))
-                soi = pending.find(b"\xff\xd8")
-                if soi < 0:
-                    pending += self._recv_exact(sock, 4096)
+                jpeg = reader.read_frame()
+                if jpeg is None:
+                    chunk = sock.recv(65536)
+                    if not chunk:
+                        raise ConnectionError("connection closed")
+                    reader.feed(chunk)
                     continue
-                head = pending[:soi]
-                cl = None
-                for line in head.split(b"\r\n"):
-                    if line.lower().startswith(b"content-length:"):
-                        cl = int(line.split(b":")[1].strip())
-                if cl is None:
-                    pending = pending[soi:] + self._recv_exact(sock, 4096)
-                    continue
-                while len(pending) - soi < cl:
-                    pending += self._recv_exact(sock, 4096)
-                jpeg = pending[soi: soi + cl]
-                pending = pending[soi + cl:]
 
                 bgr = cv2.imdecode(np.frombuffer(jpeg, dtype=np.uint8), cv2.IMREAD_COLOR)
                 if bgr is None:
                     continue
                 if bgr.shape[1] != self._width or bgr.shape[0] != self._height:
-                    bgr = cv2.resize(bgr, (self._width, self._height),
-                                     interpolation=cv2.INTER_AREA)
+                    bgr = self._letterbox(bgr)
                 self._write_frame(ptr, bgr)
         finally:
             sock.close()
             if self._sock is sock:
                 self._sock = None
 
-    def _recv_exact(self, sock, n):
-        buf = b""
-        while len(buf) < n:
-            chunk = sock.recv(n - len(buf))
-            if not chunk:
-                raise ConnectionError("connection closed")
-            buf += chunk
-        return buf
+    def _letterbox(self, bgr):
+        """Fit the source into the negotiated output preserving aspect ratio
+        (black bars, never stretch). The source is the phone's native frame
+        (e.g. 16:9 720p while the client asked for 4:3 640x480); the canvas is
+        cached per target size."""
+        sw, sh = bgr.shape[1], bgr.shape[0]
+        tw, th = self._width, self._height
+        scale = min(tw / sw, th / sh)
+        nw, nh = max(1, int(round(sw * scale))), max(1, int(round(sh * scale)))
+        resized = cv2.resize(
+            bgr, (nw, nh),
+            interpolation=cv2.INTER_AREA if scale < 1.0 else cv2.INTER_LINEAR)
+        if not hasattr(self, "_canvas") or self._canvas.shape[:2] != (th, tw):
+            self._canvas = np.zeros((th, tw, 3), dtype=np.uint8)
+        canvas = self._canvas
+        x0, y0 = (tw - nw) // 2, (th - nh) // 2
+        canvas[:] = 0
+        canvas[y0:y0 + nh, x0:x0 + nw] = resized
+        return canvas
 
     def _write_frame(self, ptr, bgr):
         # Slices in flat byte offsets (w*h, w*h/4): the I420 U/V planes are
@@ -441,16 +586,29 @@ def main():
     def restart_adb():
         bridge.restart_adb()  # async, never freezes the UI
 
-    def set_res(w, h):
-        bridge.set_resolution(w, h)
+    def set_res(w, h, fps=None):
+        bridge.set_resolution(w, h, fps)
         root.after(0, update_ui)
 
-    def res_action(w, h):
+    def res_action(w, h, fps):
         # pystray rejects lambdas with default args; use a closure factory
-        return lambda icon, item: set_res(w, h)
+        return lambda icon, item: set_res(w, h, fps)
 
     def res_checked(w, h):
         return lambda item: bridge.resolution == (w, h)
+
+    def build_res_menu(item=None):
+        # Conditional options straight from the phone's capability table;
+        # only combinations the phone can actually sustain are offered.
+        caps = bridge.capabilities
+        items = []
+        for (w, h, fps, enc) in caps:
+            label = f"{w}x{h} @ {fps} fps"
+            items.append(MenuItem(label, res_action(w, h, fps),
+                                  checked=res_checked(w, h)))
+        if not items:
+            items.append(MenuItem("(phone offline)", None, enabled=False))
+        return Menu(*items)
 
     def on_quit(icon=None, item=None):
         bridge.stop()
@@ -469,15 +627,13 @@ def main():
     tk.Button(btn_row, text="Stop", width=8, command=stop).pack(side="left", padx=4)
     tk.Button(btn_row, text="Restart ADB", width=12, command=restart_adb).pack(side="left", padx=4)
 
-    res_menu = pystray.Menu(
-        *[MenuItem(f"{w}x{h}", res_action(w, h), checked=res_checked(w, h))
-          for w, h in RESOLUTIONS]
-    )
+    # Dynamic submenu: rebuilt on open, so the phone's capability table is
+    # always current.
     menu = pystray.Menu(
         MenuItem("Show Window", lambda icon, item: root.deiconify(), default=True),
         MenuItem("Start", lambda icon, item: start(), enabled=lambda item: not bridge.running),
         MenuItem("Stop", lambda icon, item: stop(), enabled=lambda item: bridge.running),
-        MenuItem("Resolution", res_menu),
+        MenuItem("Resolution", submenu=build_res_menu),
         MenuItem("Restart ADB", lambda icon, item: restart_adb()),
         Menu.SEPARATOR,
         MenuItem("Quit", on_quit),
