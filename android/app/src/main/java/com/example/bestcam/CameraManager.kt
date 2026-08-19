@@ -20,15 +20,19 @@ import androidx.core.content.ContextCompat
 import androidx.lifecycle.LifecycleOwner
 import android.os.Handler
 import android.os.Looper
+import com.example.bestcam.encoder.EncodedFrame
+import com.example.bestcam.encoder.FrameEncoder
+import com.example.bestcam.encoder.H264Encoder
+import com.example.bestcam.encoder.JpegEncoder
 import java.io.ByteArrayOutputStream
 import java.nio.ByteBuffer
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 
-/** A negotiable stream option: resolution x frame-rate that the phone can
- * actually sustain (frame-rate gated by real encode cost, not just HAL
- * capability). Aspect is implicit in w/h. */
-data class Capability(val w: Int, val h: Int, val maxFps: Int, val encodeMs: Int)
+/** A negotiable stream option: resolution x frame-rate x codec that the phone
+ * can actually sustain. Frame-rate is gated by real encode cost, not just HAL
+ * capability. Aspect is implicit in w/h. */
+data class Capability(val w: Int, val h: Int, val maxFps: Int, val encodeMs: Int, val codec: String = "mjpeg")
 
 class CameraManager(
     private val context: Context,
@@ -53,18 +57,21 @@ class CameraManager(
     var isBeautyFilterEnabled = false
 
 fun setHardwareEncoding(enabled: Boolean) {
-        // TODO: wire to encoder selection
+        val newCodec = if (enabled) "h264" else "mjpeg"
+        if (newCodec.equals(outCodec, ignoreCase = true)) return
+        setStreamConfig(outW, outH, outFps, newCodec)
     }
 
     fun getStreamConfigString(): String {
         return "${outW}x${outH}@${outFps} ${outCodec.uppercase()}"
     }
 
-    // Negotiated output (protocol) resolution/fps — what JPEGs are produced at.
+    // Negotiated output (protocol) resolution/fps/codec.
     private var outW = 1280
     private var outH = 720
     private var outFps = 60
     private var outCodec = "mjpeg"
+    private var encoder: FrameEncoder = JpegEncoder(quality, ::applyBeautyFilter)
 
     // Capability table (static probe, refreshed after encode-cost calibration)
     private val capsLock = Any()
@@ -73,8 +80,9 @@ fun setHardwareEncoding(enabled: Boolean) {
 
     // Default per-pixel encode cost estimate used before calibration
     // (Snapdragon 8-series soft-encodes ~7-12ns/px: 720p ≈ 7-11ms, 1080p ≈
-    // 15-25ms, 480p ≈ 3ms).
+    // 15-25ms, 480p ≈ 3ms). H.264 hardware encode is ~1.5ns/px.
     private val defaultNsPerPx = 12.0
+    private val defaultH264NsPerPx = 1.5
 
     private var nv21Buffer: ByteArray? = null
     private val jpegOutStream = ThreadLocal.withInitial { ByteArrayOutputStream(200_000) }
@@ -174,12 +182,33 @@ fun setHardwareEncoding(enabled: Boolean) {
     @SuppressLint("UnsafeOptInUsageError")
     private fun processImage(imageProxy: ImageProxy) {
         val t0 = System.nanoTime()
-        val jpegData = imageProxy.toJpeg()
-        if (jpegData != null) {
-            server.sendFrame(jpegData)
+        val width = imageProxy.width
+        val height = imageProxy.height
+
+        // center-crop to the negotiated output aspect (usually 16:9)
+        val cropW = if (width * 9 > height * 16) height * 16 / 9 else width
+        val cropH = if (width * 9 > height * 16) height else width * 9 / 16
+        val x0 = (width - cropW) / 2
+        val y0 = (height - cropH) / 2
+
+        val scaled = ByteArray(outW * outH * 3 / 2)
+        yuv420ToNv21Scaled(imageProxy, scaled, x0, y0, cropW, cropH, outW, outH)
+        val tSample = System.nanoTime()
+
+        if (isBeautyFilterEnabled) {
+            applyBeautyFilter(scaled, outW, outH)
+        }
+
+        val encoded = encoder.encode(scaled, outW, outH)
+        val tEnc = System.nanoTime()
+        if (encoded != null) {
+            server.sendFrame(encoded)
+        } else {
+            Log.w("CameraManager", "encoder returned null for ${outW}x${outH}")
         }
         imageProxy.close()
-        encSumNs += System.nanoTime() - t0
+
+        encSumNs += tEnc - t0
         if (++encCount >= 30) {
             Log.i("CameraManager",
                 "avg encode ${encSumNs / encCount / 1_000_000}ms/frame over $encCount frames")
@@ -189,46 +218,23 @@ fun setHardwareEncoding(enabled: Boolean) {
         }
     }
 
-    /** Convert the frame to a 1280x720 (16:9, center-cropped) JPEG.
-     *
-     * Some sensors only expose square/4:3 sizes (e.g. 1940x1940); compressing
-     * those at full size takes ~60ms on phone CPUs -> ~15fps stream. The
-     * YUV_420_888 planes are sampled straight into a 720p NV21 buffer
-     * (crop+scale+format conversion in one pass, no full-size intermediate),
-     * so the JPEG is ~2.5x smaller and the stream reaches ~30fps with a
-     * correct 16:9 aspect for ExVR's 800x450 processing.
-     */
-    private fun ImageProxy.toJpeg(): ByteArray? {
-        return try {
-            val tEnc = System.nanoTime()
-            val width = this.width
-            val height = this.height
-
-            // center-crop to 16:9
-            val cropW = if (width * 9 > height * 16) height * 16 / 9 else width
-            val cropH = if (width * 9 > height * 16) height else width * 9 / 16
-            val x0 = (width - cropW) / 2
-            val y0 = (height - cropH) / 2
-
-            val scaled = ByteArray(outW * outH * 3 / 2)
-            yuv420ToNv21Scaled(this, scaled, x0, y0, cropW, cropH, outW, outH)
-            val tSample = System.nanoTime()
-
-            if (isBeautyFilterEnabled) {
-                applyBeautyFilter(scaled, outW, outH)
+    /** Create or recreate the encoder to match the negotiated codec and size. */
+    private fun createEncoder() {
+        try {
+            encoder.release()
+        } catch (_: Exception) {
+        }
+        encoder = when (outCodec.lowercase()) {
+            "h264" -> {
+                try {
+                    H264Encoder(outW, outH, outFps)
+                } catch (e: Exception) {
+                    Log.e("CameraManager", "H264 encoder failed, falling back to JPEG", e)
+                    outCodec = "mjpeg"
+                    JpegEncoder(quality, ::applyBeautyFilter)
+                }
             }
-
-            val yuvImage = YuvImage(scaled, ImageFormat.NV21, outW, outH, null)
-            val out = jpegOutStream.get()!!
-            out.reset()
-            yuvImage.compressToJpeg(Rect(0, 0, outW, outH), quality, out)
-            val tJpeg = System.nanoTime()
-            Log.d("CameraManager",
-                "sample=${(tSample - tEnc) / 1_000_000}ms jpeg=${(tJpeg - tSample) / 1_000_000}ms in=${width}x$height")
-            out.toByteArray()
-        } catch (e: Exception) {
-            Log.e("CameraManager", "JPEG conversion failed", e)
-            null
+            else -> JpegEncoder(quality, ::applyBeautyFilter)
         }
     }
 
@@ -403,22 +409,25 @@ fun setHardwareEncoding(enabled: Boolean) {
     }
 
     fun setResolution(width: Int, height: Int) {
-        setStreamConfig(width, height, outFps)
+        setStreamConfig(width, height, outFps, outCodec)
     }
 
-    /** Rebind the camera pipeline to a negotiated output (resolution x fps).
+    /** Rebind the camera pipeline to a negotiated output (resolution x fps x codec).
      * Returns the closest supported option if the requested one is not in the
      * capability table (never fails). */
-    fun setStreamConfig(width: Int, height: Int, fps: Int) {
-        val cap = pickCapability(width, height, fps)
+    fun setStreamConfig(width: Int, height: Int, fps: Int, codec: String = "mjpeg") {
+        val cap = pickCapability(width, height, fps, codec)
         val w = cap?.w ?: width
         val h = cap?.h ?: height
         val f = cap?.maxFps ?: fps
-        if (w == outW && h == outH && f == outFps) return
+        val c = (cap?.codec ?: codec).lowercase()
+        if (w == outW && h == outH && f == outFps && c == outCodec) return
         outW = w
         outH = h
         outFps = f
-        Log.i("CameraManager", "setStreamConfig -> ${w}x$h @ $f fps")
+        outCodec = c
+        createEncoder()
+        Log.i("CameraManager", "setStreamConfig -> ${w}x$h @ $f fps [$outCodec]")
         if (cameraProvider != null) {
             mainHandler.post { bindCameraUseCases() }
         } else {
@@ -460,15 +469,24 @@ fun setHardwareEncoding(enabled: Boolean) {
             .filter { it.width >= 480 && it.width <= 1920 && it.height >= 270 && it.height <= 1080 }
             .sortedByDescending { it.width.toLong() * it.height }
         Log.i("CameraManager", "filtered: ${filtered.joinToString { "${it.width}x${it.height}" }}")
-        val out = filtered.mapNotNull { size ->
-            val encodeMs = estimateEncodeMs(size.width.toLong() * size.height)
+        val out = mutableListOf<Capability>()
+        filtered.forEach { size ->
+            val pixels = size.width.toLong() * size.height
+            val encodeMs = estimateEncodeMs(pixels)
             val fpsFromEncode = 1000.0 / encodeMs
-            val is1080pTier = size.width.toLong() * size.height > 1280L * 720
+            val is1080pTier = pixels > 1280L * 720
             val maxFps = if (is1080pTier) 30.0 else minOf(60.0, fpsFromEncode)
             Log.d("CameraManager", "probe ${size.width}x${size.height}: enc=${"%.1f".format(encodeMs)}ms fpsEnc=${"%.1f".format(fpsFromEncode)} max=$maxFps calib=$calibNsPerPx")
-            if (maxFps < 24) return@mapNotNull null   // too slow, drop the option
-            val tier = if (maxFps >= 55) 60 else if (maxFps >= 27) 30 else 15
-            Capability(size.width, size.height, tier, (encodeMs + 0.5).toInt())
+            if (maxFps >= 24) {
+                val tier = if (maxFps >= 55) 60 else if (maxFps >= 27) 30 else 15
+                out.add(Capability(size.width, size.height, tier, (encodeMs + 0.5).toInt(), "mjpeg"))
+            }
+            // H.264 hardware encode is fast enough for 60fps at all sizes here;
+            // 1080p-tier is still capped at 30fps to mirror the companion/driver
+            // default and keep bandwidth reasonable.
+            val h264Ms = (defaultH264NsPerPx * pixels / 1e6 + 0.5).toInt().coerceAtLeast(1)
+            val h264Fps = if (is1080pTier) 30 else 60
+            out.add(Capability(size.width, size.height, h264Fps, h264Ms, "h264"))
         }
         synchronized(capsLock) {
             if (caps.isEmpty()) caps = out
@@ -479,16 +497,19 @@ fun setHardwareEncoding(enabled: Boolean) {
 
     /** Resolve a requested combo against the capability table: exact match, or
      * same aspect at the closest size, or any closest size. */
-    fun pickCapability(w: Int, h: Int, fps: Int): Capability? {
+    fun pickCapability(w: Int, h: Int, fps: Int, codec: String = "mjpeg"): Capability? {
         val table = probeCapabilities()
         if (table.isEmpty()) return null
-        return table.firstOrNull { it.w == w && it.h == h && it.maxFps == fps }
+        val codecNorm = codec.lowercase()
+        return table.firstOrNull { it.w == w && it.h == h && it.maxFps == fps && it.codec == codecNorm }
+            ?: table.firstOrNull { it.w == w && it.h == h && it.codec == codecNorm }
             ?: table.firstOrNull { it.w == w && it.h == h }
-            ?: table.firstOrNull { aspectKey(it.w, it.h) == aspectKey(w, h) }
+            ?: table.firstOrNull { aspectKey(it.w, it.h) == aspectKey(w, h) && it.codec == codecNorm }
             ?: table.minByOrNull { kotlin.math.abs(it.w.toLong() * it.h - w.toLong() * h) }
     }
 
-    /** Feed real encode timings into the calibration; recompute the table. */
+    /** Feed real encode timings into the calibration; recompute the table for
+     * the active codec only. */
     fun calibrate(encodeNs: Long, frames: Int) {
         if (frames <= 0 || outW * outH <= 0) return
         calibNsPerPx = encodeNs.toDouble() / (frames * outW.toLong() * outH)
@@ -497,12 +518,13 @@ fun setHardwareEncoding(enabled: Boolean) {
         synchronized(capsLock) {
             if (caps.isEmpty()) return
             caps = caps.map { c ->
+                if (c.codec != outCodec) return@map c
                 val ms = estimateEncodeMs(c.w.toLong() * c.h)
                 val fpsFromEncode = 1000.0 / ms
                 val is1080pTier = c.w.toLong() * c.h > 1280L * 720
                 val max = if (is1080pTier) 30.0 else minOf(60.0, fpsFromEncode)
                 val tier = if (max >= 55) 60 else if (max >= 27) 30 else 15
-                Capability(c.w, c.h, tier, (ms + 0.5).toInt())
+                Capability(c.w, c.h, tier, (ms + 0.5).toInt(), c.codec)
             }
         }
     }
@@ -529,9 +551,12 @@ fun setHardwareEncoding(enabled: Boolean) {
     }
 
     private fun defaultCaps(): List<Capability> = listOf(
-        Capability(1920, 1080, 30, 25),
-        Capability(1280, 720, 60, 10),
-        Capability(640, 480, 60, 4)
+        Capability(1920, 1080, 30, 25, "mjpeg"),
+        Capability(1280, 720, 60, 10, "mjpeg"),
+        Capability(640, 480, 60, 4, "mjpeg"),
+        Capability(1920, 1080, 30, 4, "h264"),
+        Capability(1280, 720, 60, 2, "h264"),
+        Capability(640, 480, 60, 1, "h264")
     )
 
     fun shutdown() {

@@ -1,6 +1,7 @@
 package com.example.bestcam
 
 import android.util.Log
+import com.example.bestcam.encoder.EncodedFrame
 import java.io.BufferedOutputStream
 import java.io.IOException
 import java.io.OutputStream
@@ -24,13 +25,13 @@ class MjpegServer(private val port: Int = 8080) {
     private var isRunning = false
     private var frameCount = 0L
 
-    private val latestFrame = AtomicReference<ByteArray?>()
+    private val latestFrame = AtomicReference<EncodedFrame?>()
     private val lock = ReentrantLock()
     private val frameCondition = lock.newCondition()
 
     // Control channel hooks (wired up by MainActivity)
     var capabilityProvider: (() -> List<Capability>)? = null
-    var resolutionListener: ((w: Int, h: Int, fps: Int) -> Unit)? = null
+    var resolutionListener: ((w: Int, h: Int, fps: Int, codec: String) -> Unit)? = null
     private var controlSocket: ServerSocket? = null
 
     fun start() {
@@ -96,9 +97,10 @@ class MjpegServer(private val port: Int = 8080) {
                             val w = parts[1].toIntOrNull()
                             val h = parts[2].toIntOrNull()
                             val fps = parts[3].toIntOrNull()
+                            val codec = if (parts.size >= 5) parts[4].lowercase() else "mjpeg"
                             if (w != null && h != null && fps != null) {
-                                resolutionListener?.invoke(w, h, fps)
-                                Log.d("MjpegServer", "set_resolution ${w}x$h @ $fps")
+                                resolutionListener?.invoke(w, h, fps, codec)
+                                Log.d("MjpegServer", "set_resolution ${w}x$h @ $fps [$codec]")
                             }
                         }
                         output.write("OK\r\n".toByteArray())
@@ -125,6 +127,7 @@ class MjpegServer(private val port: Int = 8080) {
                 .append(",\"h\":").append(c.h)
                 .append(",\"max_fps\":").append(c.maxFps)
                 .append(",\"encode_ms\":").append(c.encodeMs)
+                .append(",\"codec\":\"").append(c.codec).append("\"")
                 .append('}')
         }
         sb.append("]}")
@@ -161,8 +164,8 @@ class MjpegServer(private val port: Int = 8080) {
         }
     }
 
-    fun sendFrame(jpegData: ByteArray) {
-        latestFrame.set(jpegData)
+    fun sendFrame(frame: EncodedFrame) {
+        latestFrame.set(frame)
         lock.withLock {
             frameCondition.signalAll()
         }
@@ -170,7 +173,7 @@ class MjpegServer(private val port: Int = 8080) {
 
     private fun sendLoop() {
         while (isRunning) {
-            val jpegData = lock.withLock {
+            val frame = lock.withLock {
                 while (latestFrame.get() == null && isRunning) {
                     try {
                         frameCondition.await(100, TimeUnit.MILLISECONDS)
@@ -181,23 +184,24 @@ class MjpegServer(private val port: Int = 8080) {
                 latestFrame.getAndSet(null)
             }
 
-            if (jpegData != null && clients.isNotEmpty()) {
-                broadcastFrame(jpegData)
+            if (frame != null && clients.isNotEmpty()) {
+                broadcastFrame(frame)
             }
         }
     }
 
-    private fun broadcastFrame(jpegData: ByteArray) {
+    private fun broadcastFrame(frame: EncodedFrame) {
         frameCount++
 
-        val boundary = "--boundary\r\nContent-Type: image/jpeg\r\nContent-Length: ${jpegData.size}\r\n\r\n"
+        val contentType = if (frame.codec == "h264") "video/h264" else "image/jpeg"
+        val boundary = "--boundary\r\nContent-Type: $contentType\r\nContent-Length: ${frame.data.size}\r\n\r\n"
         val boundaryBytes = boundary.toByteArray()
         val footerBytes = "\r\n".toByteArray()
         
-        val packet = ByteArray(boundaryBytes.size + jpegData.size + footerBytes.size)
+        val packet = ByteArray(boundaryBytes.size + frame.data.size + footerBytes.size)
         System.arraycopy(boundaryBytes, 0, packet, 0, boundaryBytes.size)
-        System.arraycopy(jpegData, 0, packet, boundaryBytes.size, jpegData.size)
-        System.arraycopy(footerBytes, 0, packet, boundaryBytes.size + jpegData.size, footerBytes.size)
+        System.arraycopy(frame.data, 0, packet, boundaryBytes.size, frame.data.size)
+        System.arraycopy(footerBytes, 0, packet, boundaryBytes.size + frame.data.size, footerBytes.size)
 
         val iterator = clients.iterator()
         while (iterator.hasNext()) {
