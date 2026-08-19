@@ -12,16 +12,15 @@
 VirtualCamMediaStream::VirtualCamMediaStream() : _active(false), _lastFrameIndex(0) {}
 VirtualCamMediaStream::~VirtualCamMediaStream() {}
 
-// Supported resolutions (NV12, 30fps). Clients (e.g. ExVR) negotiate one of
-// these; frame data size follows the shared-memory header written by the
-// companion script, which must match the negotiated resolution.
-static const struct ResEntry { UINT32 width, height; } kSupportedResolutions[] = {
-    {1920, 1080},
-    {1280, 720},
-    {800, 600},
-    {800, 450},
-    {640, 480},
-};
+// Negotiated output resolution comes from the shared-memory header written by
+// the companion (the single authority in this design): the driver advertises
+// exactly ONE media type — the current negotiated resolution — so a client
+// (ExVR/OBS) can never pick a size the phone cannot deliver. Frame rate maps
+// from the pixel tier: 1080p-class sizes run 30fps, smaller ones 60fps
+// (mirrors the phone's capability table). The type is re-read each time the
+// source is created, i.e. on every client open; mid-session switches are
+// protected by the blank-frame fallback in RequestSample.
+static const UINT32 kDefaultW = 1920, kDefaultH = 1080;
 
 // Cache buffer covers the largest frame the mapping can hold.
 static const DWORD MAX_FRAME_BYTES = 1920 * 1080 * 3 / 2;
@@ -33,15 +32,24 @@ HRESULT VirtualCamMediaStream::RuntimeClassInitialize(VirtualCamMediaSource* pSo
     HRESULT hr = MFCreateEventQueue(&_eventQueue);
     if (FAILED(hr)) return hr;
 
-    std::vector<Microsoft::WRL::ComPtr<IMFMediaType>> types;
-    types.reserve(std::size(kSupportedResolutions));
-    for (const auto& res : kSupportedResolutions)
+    _frameServer = std::make_unique<FrameServer>();
+    _frameServer->Initialize(); // Non-fatal if the companion script isn't running yet
+
+    // Single advertised type: whatever resolution the companion is pushing.
+    UINT32 w = _frameServer->GetWidth();
+    UINT32 h = _frameServer->GetHeight();
+    if (w < 320 || h < 240 || w > kDefaultW || h > kDefaultH)
     {
-        Microsoft::WRL::ComPtr<IMFMediaType> mediaType;
-        hr = CreateMediaType(res.width, res.height, &mediaType);
-        if (FAILED(hr)) return hr;
-        types.push_back(std::move(mediaType));
+        w = kDefaultW;   // companion not up yet / garbage header: sane default
+        h = kDefaultH;
     }
+
+    std::vector<Microsoft::WRL::ComPtr<IMFMediaType>> types;
+    types.reserve(1);
+    Microsoft::WRL::ComPtr<IMFMediaType> mediaType;
+    hr = CreateMediaType(w, h, &mediaType);
+    if (FAILED(hr)) return hr;
+    types.push_back(std::move(mediaType));
 
     std::vector<IMFMediaType*> typeArr;
     typeArr.reserve(types.size());
@@ -67,6 +75,8 @@ HRESULT VirtualCamMediaStream::CreateMediaType(UINT32 width, UINT32 height, IMFM
     const UINT32 STRIDE = width;
     // NV12 format size: Y plane + (UV plane)
     const UINT32 SAMPLE_SIZE = width * height * 3 / 2;
+    // Mirror the phone capability tiers: 1080p-class -> 30fps, else 60fps.
+    const UINT32 FPS = (width * height > 1280 * 720) ? 30 : 60;
 
     Microsoft::WRL::ComPtr<IMFMediaType> mediaType;
     HRESULT hr = MFCreateMediaType(&mediaType);
@@ -78,7 +88,7 @@ HRESULT VirtualCamMediaStream::CreateMediaType(UINT32 width, UINT32 height, IMFM
     if (FAILED(hr)) return hr;
     hr = MFSetAttributeSize(mediaType.Get(), MF_MT_FRAME_SIZE, width, height);
     if (FAILED(hr)) return hr;
-    hr = MFSetAttributeRatio(mediaType.Get(), MF_MT_FRAME_RATE, 30, 1);
+    hr = MFSetAttributeRatio(mediaType.Get(), MF_MT_FRAME_RATE, FPS, 1);
     if (FAILED(hr)) return hr;
     hr = MFSetAttributeRatio(mediaType.Get(), MF_MT_PIXEL_ASPECT_RATIO, 1, 1);
     if (FAILED(hr)) return hr;
@@ -286,7 +296,7 @@ STDMETHODIMP VirtualCamMediaStream::RequestSample(IUnknown* pToken)
 
     sample->AddBuffer(buffer.Get());
     sample->SetSampleTime(MFGetSystemTime());
-    sample->SetSampleDuration(333333); // ~30 fps in 100-nanosecond units
+    sample->SetSampleDuration(166667); // ~60 fps in 100-nanosecond units
 
     if (pToken)
         sample->SetUnknown(MFSampleExtension_Token, pToken);
@@ -324,7 +334,7 @@ void VirtualCamMediaStream::QueueBlankSample(IUnknown* pToken)
 
     sample->AddBuffer(buffer.Get());
     sample->SetSampleTime(MFGetSystemTime());
-    sample->SetSampleDuration(333333); // ~30 fps in 100-nanosecond units
+    sample->SetSampleDuration(166667); // ~60 fps in 100-nanosecond units
 
     if (pToken)
         sample->SetUnknown(MFSampleExtension_Token, pToken);
