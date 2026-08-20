@@ -23,7 +23,7 @@ import sys
 
 # Windows Media Foundation H.264 decoder (optional, Windows-only)
 try:
-    from pyMFT.decoder import MFTDecoder as _MFTDecoder
+    from pymft_h264.decoder import MFTDecoder as _MFTDecoder
 except Exception:
     _MFTDecoder = None
 

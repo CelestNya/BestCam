@@ -1,0 +1,20 @@
+[project]
+name = "bestcam-companion"
+version = "0.1.0"
+description = "BestCam PC companion: receive phone stream and feed a Windows virtual camera"
+requires-python = ">=3.11"
+dependencies = [
+    "av",
+    "imageio-ffmpeg",
+    "numpy",
+    "opencv-python",
+    "pillow",
+    "pystray",
+    "pywin32",
+    "pymft-h264 @ git+https://github.com/CelestNya/pymft-h264.git",
+]
+
+[tool.uv]
+dev-dependencies = [
+    "pyinstaller>=6",
+]

@@ -30,7 +30,7 @@ from decoder import (
 )
 
 try:
-    from pyMFT.decoder import MFTDecoder
+    from pymft_h264.decoder import MFTDecoder
 except Exception:
     MFTDecoder = None
 

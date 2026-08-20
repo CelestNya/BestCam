@@ -1,5 +1,4 @@
 # -*- mode: python ; coding: utf-8 -*-
-import os
 from PyInstaller.utils.hooks import collect_all
 
 # Bundle the FFmpeg binary used for optional hardware decoding.
@@ -9,21 +8,10 @@ try:
 except Exception:
     ffmpeg_binary = None
 
-# Bundle the pyMFT DLL if it has been built.
-pymft_dll = os.path.join(os.path.abspath(SPECPATH), 'pyMFT', 'pyMFT.dll')
-pymft_dll = pymft_dll if os.path.exists(pymft_dll) else None
-print(f"pyMFT DLL path: {pymft_dll}")
-
 datas = []
-binaries = []
-if ffmpeg_binary:
-    binaries.append((ffmpeg_binary, '.'))
-if pymft_dll:
-    # Place the DLL next to the pyMFT Python package so _find_dll() sees it.
-    datas.append((pymft_dll, 'pyMFT'))
-
-hiddenimports = ['PIL.Image', 'win32event', 'pyMFT', 'pyMFT.decoder']
-for pkg in ('pystray', 'av', 'imageio_ffmpeg'):
+binaries = [(ffmpeg_binary, '.')] if ffmpeg_binary else []
+hiddenimports = ['PIL.Image', 'win32event']
+for pkg in ('pystray', 'av', 'imageio_ffmpeg', 'pymft_h264'):
     tmp_ret = collect_all(pkg)
     datas += tmp_ret[0]
     binaries += tmp_ret[1]
