@@ -426,8 +426,8 @@ wheels = [
 
 [[package]]
 name = "pymft-h264"
-version = "0.1.0"
-source = { git = "https://github.com/CelestNya/pymft-h264.git#5a92865b2aed10ef999ce54aedca6d215ddafe93" }
+version = "0.2.1"
+source = { git = "https://github.com/CelestNya/pymft-h264.git#9897cccc81f1e021b580f98531e8a0b0d7501299" }
 dependencies = [
     { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12'" },
     { name = "numpy", version = "2.5.2", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },

@@ -29,13 +29,19 @@ except Exception:
 
 
 def create_h264_decoder(use_hw: bool = False, hwaccel: str = "",
-                        width: int = 0, height: int = 0, fps: int = 60) -> "FrameDecoder":
+                        width: int = 0, height: int = 0, fps: int = 60,
+                        enable_hardware: bool = True,
+                        adapter_luid: int | None = None) -> "FrameDecoder":
     """Return the best available H.264 decoder for this machine.
 
     Preference order:
       1. FFmpeg hardware decoder if explicitly requested.
-      2. Windows MFT native decoder on Windows (hardware-capable, broad support).
+      2. Windows MFT native decoder on Windows (hardware-capable by default).
       3. PyAV software decoder as universal fallback.
+
+    Set enable_hardware=False to force the software fallback (e.g. for a
+    "CPU only" menu option). adapter_luid pins MFT decoding to a specific
+    GPU; None selects the default (prefer iGPU when enable_hardware=True).
     """
     if use_hw and hwaccel:
         try:
@@ -43,9 +49,9 @@ def create_h264_decoder(use_hw: bool = False, hwaccel: str = "",
         except Exception:
             pass
 
-    if sys.platform == "win32" and _MFTDecoder is not None:
+    if sys.platform == "win32" and _MFTDecoder is not None and enable_hardware:
         try:
-            return _MFTDecoder(width=width, height=height)
+            return _MFTDecoder(width=width, height=height, adapter_luid=adapter_luid)
         except Exception:
             # Fall through to PyAV
             pass

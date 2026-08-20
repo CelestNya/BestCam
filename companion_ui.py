@@ -31,8 +31,10 @@ from decoder import (
 
 try:
     from pymft_h264.decoder import MFTDecoder
+    from pymft_h264 import list_adapters as _list_mft_adapters
 except Exception:
     MFTDecoder = None
+    _list_mft_adapters = None
 
 SHARED_MEM_NAME = "Global\\BestCam_SharedMem"
 MUTEX_NAME = "Global\\BestCam_Mutex"
@@ -182,6 +184,7 @@ class Bridge:
         self._codec = os.environ.get("BESTCAM_CODEC", "h264").lower()
         self._hwaccel = os.environ.get("BESTCAM_HWACCEL", "d3d11va").lower()
         self._use_hw = os.environ.get("BESTCAM_USE_HW", "").lower() in ("1", "true", "yes")
+        self._mft_adapter_luid = None
         self._frame_size = width * height * 3 // 2
         self._on_status = on_status
         # Phone capability table: list of (w, h, max_fps, encode_ms, codec).
@@ -385,6 +388,11 @@ class Bridge:
         self._use_hw = self._hwaccel not in ("cpu", "mft")
         self._release_decoder()
 
+    def set_mft_adapter(self, luid: int | None):
+        """Select a specific GPU for Windows MFT decoding (None = auto)."""
+        self._mft_adapter_luid = luid
+        self._release_decoder()
+
     def _release_decoder(self):
         with self._decoder_lock:
             self._release_decoder_unsafe()
@@ -424,8 +432,12 @@ class Bridge:
                     except Exception:
                         self._decoder = create_h264_decoder(width=self._width, height=self._height)
                         self.decoder_text = getattr(self._decoder, "name", lambda: "fallback")()
+                elif self._hwaccel == "cpu":
+                    self._decoder = create_h264_decoder(width=self._width, height=self._height, enable_hardware=False)
+                    self.decoder_text = getattr(self._decoder, "name", lambda: "CPU")()
                 else:
-                    self._decoder = create_h264_decoder(width=self._width, height=self._height)
+                    self._decoder = create_h264_decoder(width=self._width, height=self._height,
+                                                          adapter_luid=self._mft_adapter_luid)
                     self.decoder_text = getattr(self._decoder, "name", lambda: "CPU")()
             else:
                 return None
@@ -734,6 +746,28 @@ def main():
             items.append(MenuItem(label, hw_action(name), checked=hw_checked(name)))
         return Menu(*items)
 
+    def set_adapter(luid: int | None):
+        bridge.set_mft_adapter(luid)
+        root.after(0, update_ui)
+
+    def adapter_action(luid: int | None):
+        return lambda icon, item: set_adapter(luid)
+
+    def adapter_checked(luid: int | None):
+        return lambda item: bridge._mft_adapter_luid == luid
+
+    def build_adapter_menu(item=None):
+        items = [MenuItem("Auto (prefer iGPU)", adapter_action(None), checked=adapter_checked(None))]
+        if _list_mft_adapters is not None:
+            for a in _list_mft_adapters():
+                name = a.name.decode("utf-8", "ignore").rstrip("\x00")
+                kind = "iGPU" if a.is_integrated else ("SW" if a.is_software else "dGPU")
+                label = f"{name} ({kind})"
+                items.append(MenuItem(label, adapter_action(a.luid), checked=adapter_checked(a.luid)))
+        if len(items) == 1:
+            items.append(MenuItem("(no adapters found)", None, enabled=False))
+        return Menu(*items)
+
     def on_quit(icon=None, item=None):
         bridge.stop()
         subprocess.run(["taskkill", "/IM", "BestCamHost.exe", "/F"],
@@ -760,6 +794,7 @@ def main():
         MenuItem("Stop", lambda icon, item: stop(), enabled=lambda item: bridge.running),
         MenuItem("Resolution", Menu(build_res_menu)),
         MenuItem("Decoder Device", Menu(build_dec_menu)),
+        MenuItem("MFT Adapter", Menu(build_adapter_menu)),
         MenuItem("Restart ADB", lambda icon, item: restart_adb()),
         pystray.Menu.SEPARATOR,
         MenuItem("Quit", on_quit),
