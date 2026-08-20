@@ -47,7 +47,7 @@ import time
 import cv2
 import numpy as np
 
-from decoder import PyAVH264Decoder, SoftDecoder
+from decoder import create_h264_decoder, SoftDecoder
 
 target_w = int(os.environ.get("BESTCAM_WIDTH", "1920"))
 target_h = int(os.environ.get("BESTCAM_HEIGHT", "1080"))
@@ -295,7 +295,7 @@ def main():
 
     decoder = None
     if target_codec == "h264":
-        decoder = PyAVH264Decoder()
+        decoder = create_h264_decoder(width=target_w, height=target_h)
     else:
         decoder = SoftDecoder()
 

@@ -25,8 +25,14 @@ from decoder import (
     FFmpegHwDecoder,
     PyAVH264Decoder,
     SoftDecoder,
+    create_h264_decoder,
     list_hw_devices,
 )
+
+try:
+    from pyMFT.decoder import MFTDecoder
+except Exception:
+    MFTDecoder = None
 
 SHARED_MEM_NAME = "Global\\BestCam_SharedMem"
 MUTEX_NAME = "Global\\BestCam_Mutex"
@@ -374,9 +380,9 @@ class Bridge:
         return self._codec
 
     def set_hwaccel(self, hwaccel: str):
-        """Set the preferred hardware accelerator ('cpu' for PyAV software)."""
+        """Set the preferred decoder ('cpu', 'mft', or a FFmpeg hwaccel)."""
         self._hwaccel = hwaccel.lower()
-        self._use_hw = self._hwaccel != "cpu"
+        self._use_hw = self._hwaccel not in ("cpu", "mft")
         self._release_decoder()
 
     def _release_decoder(self):
@@ -394,12 +400,17 @@ class Bridge:
 
     def _decoder_for(self, mime: str):
         """Return a decoder suitable for the incoming MIME type."""
+        h264_decoders = [PyAVH264Decoder, FFmpegHwDecoder]
+        if MFTDecoder is not None:
+            h264_decoders.append(MFTDecoder)
+        h264_decoders = tuple(h264_decoders)
+
         with self._decoder_lock:
             if self._decoder is not None:
                 # Reuse if MIME matches the decoder's supported input.
                 if mime == "image/jpeg" and isinstance(self._decoder, SoftDecoder):
                     return self._decoder
-                if mime == "video/h264" and isinstance(self._decoder, (PyAVH264Decoder, FFmpegHwDecoder)):
+                if mime == "video/h264" and isinstance(self._decoder, h264_decoders):
                     return self._decoder
                 self._release_decoder_unsafe()
             if mime == "image/jpeg":
@@ -411,11 +422,11 @@ class Bridge:
                         self._decoder = FFmpegHwDecoder(self._hwaccel, self._width, self._height, self._fps)
                         self.decoder_text = f"HW {self._hwaccel.upper()}"
                     except Exception:
-                        self._decoder = PyAVH264Decoder()
-                        self.decoder_text = "CPU (fallback)"
+                        self._decoder = create_h264_decoder(width=self._width, height=self._height)
+                        self.decoder_text = getattr(self._decoder, "name", lambda: "fallback")()
                 else:
-                    self._decoder = PyAVH264Decoder()
-                    self.decoder_text = "CPU"
+                    self._decoder = create_h264_decoder(width=self._width, height=self._height)
+                    self.decoder_text = getattr(self._decoder, "name", lambda: "CPU")()
             else:
                 return None
             return self._decoder
@@ -715,6 +726,8 @@ def main():
 
     def build_dec_menu(item=None):
         items = [MenuItem("CPU (software)", hw_action("cpu"), checked=hw_checked("cpu"))]
+        if MFTDecoder is not None:
+            items.append(MenuItem("Windows MFT", hw_action("mft"), checked=hw_checked("mft")))
         for dev in list_hw_devices():
             name = dev["name"]
             label = dev["label"]

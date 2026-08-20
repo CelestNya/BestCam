@@ -19,6 +19,39 @@ from typing import Optional
 
 import cv2
 import numpy as np
+import sys
+
+# Windows Media Foundation H.264 decoder (optional, Windows-only)
+try:
+    from pyMFT.decoder import MFTDecoder as _MFTDecoder
+except Exception:
+    _MFTDecoder = None
+
+
+def create_h264_decoder(use_hw: bool = False, hwaccel: str = "",
+                        width: int = 0, height: int = 0, fps: int = 60) -> "FrameDecoder":
+    """Return the best available H.264 decoder for this machine.
+
+    Preference order:
+      1. FFmpeg hardware decoder if explicitly requested.
+      2. Windows MFT native decoder on Windows (hardware-capable, broad support).
+      3. PyAV software decoder as universal fallback.
+    """
+    if use_hw and hwaccel:
+        try:
+            return FFmpegHwDecoder(hwaccel, width, height, fps)
+        except Exception:
+            pass
+
+    if sys.platform == "win32" and _MFTDecoder is not None:
+        try:
+            return _MFTDecoder(width=width, height=height)
+        except Exception:
+            # Fall through to PyAV
+            pass
+
+    return PyAVH264Decoder()
+
 
 
 def find_ffmpeg() -> str:
@@ -118,20 +151,24 @@ class PyAVH264Decoder(FrameDecoder):
     def __init__(self):
         import av
         self._av = av
+        self._codec = self._av.Codec('h264', 'r')
+        self._ctx = self._codec.create()
+        self._ctx.thread_type = "AUTO"
+        self._ctx.thread_count = 0
 
     def decode(self, data: bytes, mime: str) -> Optional[np.ndarray]:
         if mime != "video/h264" or not data:
             return None
         try:
-            # av.open() with a per-frame Annex-B access unit is more robust
-            # than CodecContext.parse() for repeated SPS/PPS prefixes.
-            bio = io.BytesIO(data)
-            with self._av.open(bio, mode="r", format="h264") as container:
-                for packet in container.demux():
-                    for frame in packet.decode():
-                        return frame.to_ndarray(format="bgr24")
+            packet = self._av.Packet(data)
+            for frame in self._ctx.decode(packet):
+                return frame.to_ndarray(format="bgr24")
         except Exception:
-            pass
+            # A corrupted access unit can break the codec; recreate it.
+            self._codec = self._av.Codec('h264', 'r')
+            self._ctx = self._codec.create()
+            self._ctx.thread_type = "AUTO"
+            self._ctx.thread_count = 0
         return None
 
     def name(self) -> str:
