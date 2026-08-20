@@ -289,6 +289,7 @@ def main():
 
     # ADB forward
     subprocess.run([ADB, "forward", f"tcp:{PORT}", f"tcp:{PORT}"], check=False, capture_output=True)
+    subprocess.run([ADB, "forward", f"tcp:{CONTROL_PORT}", f"tcp:{CONTROL_PORT}"], check=False, capture_output=True)
 
     writer = SharedMemWriter()
     print("Shared memory connected. Waiting for phone stream...")

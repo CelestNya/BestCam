@@ -544,6 +544,7 @@ class Bridge:
             return
         self._status("Device authorised")
         self._run_adb("forward", f"tcp:{PORT}", f"tcp:{PORT}")
+        self._run_adb("forward", f"tcp:{CONTROL_PORT}", f"tcp:{CONTROL_PORT}")
 
     def _open_shared_mem_and_stream(self):
         self._ensure_host()
