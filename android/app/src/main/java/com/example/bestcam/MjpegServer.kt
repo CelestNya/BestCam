@@ -113,7 +113,7 @@ class MjpegServer(private val port: Int = 8080) {
                 }
                 socket.close()
             } catch (e: Exception) {
-                Log.d("MjpegServer", "control client error", e)
+                Log.e("MjpegServer", "control client error", e)
                 try { socket.close() } catch (ignore: Exception) {}
             }
         }
@@ -159,7 +159,8 @@ class MjpegServer(private val port: Int = 8080) {
                 clientStreams[socket] = outputStream
                 Log.d("MjpegServer", "New client connected. Total: ${clients.size}")
             } catch (e: Exception) {
-                socket.close()
+                Log.e("MjpegServer", "handleNewClient error", e)
+                try { socket.close() } catch (ignore: Exception) {}
             }
         }
     }

@@ -85,6 +85,7 @@ fun setHardwareEncoding(enabled: Boolean) {
     private val defaultH264NsPerPx = 1.5
 
     private var nv21Buffer: ByteArray? = null
+    private var letterboxBuffer: ByteArray? = null
     private val jpegOutStream = ThreadLocal.withInitial { ByteArrayOutputStream(200_000) }
     private var yRow = ByteArray(0)
     private var uRow = ByteArray(0)
@@ -113,27 +114,23 @@ fun setHardwareEncoding(enabled: Boolean) {
             .requireLensFacing(lensFacing)
             .build()
 
-        // Preview follows the user-selected resolution (1080p/720p).
-        // NOTE: never combine setTargetResolution with setTargetAspectRatio —
-        // CameraX throws IllegalArgumentException and the use case fails to
-        // bind (black preview, crash on resolution switch).
+        // Use the largest supported sensor size for analysis so that every
+        // negotiated output resolution keeps the same full field-of-view.
+        val analysisSize = getMaxAnalysisSize()
+
+        // Preview follows the sensor/analysis aspect (fitCenter) so the user
+        // sees the same FOV that is being encoded.
         preview = Preview.Builder()
-            .setTargetResolution(Size(outW, outH))
+            .setTargetResolution(analysisSize)
             .build()
             .also {
                 it.setSurfaceProvider(previewView.surfaceProvider)
             }
 
-        // The analysis stream is bound to a sensor size at least as large as the
-        // negotiated output; frames are then center-cropped (to the output aspect)
-        // and scaled to outW x outH in yuv420ToNv21Scaled. The crop+scale pass is
-        // cheap (1:1 bulk copy when the crop matches), so binding a larger sensor
-        // size than needed is fine — but the AE fps hint is what actually gates
-        // capture rate, so it must follow the negotiated fps.
         val analysisSelector = ResolutionSelector.Builder()
             .setResolutionStrategy(
                 ResolutionStrategy(
-                    Size(outW, outH),
+                    analysisSize,
                     ResolutionStrategy.FALLBACK_RULE_CLOSEST_HIGHER_THEN_LOWER
                 )
             )
@@ -182,24 +179,40 @@ fun setHardwareEncoding(enabled: Boolean) {
     @SuppressLint("UnsafeOptInUsageError")
     private fun processImage(imageProxy: ImageProxy) {
         val t0 = System.nanoTime()
-        val width = imageProxy.width
-        val height = imageProxy.height
+        val srcW = imageProxy.width
+        val srcH = imageProxy.height
 
-        // center-crop to the negotiated output aspect (usually 16:9)
-        val cropW = if (width * 9 > height * 16) height * 16 / 9 else width
-        val cropH = if (width * 9 > height * 16) height else width * 9 / 16
-        val x0 = (width - cropW) / 2
-        val y0 = (height - cropH) / 2
+        // Preserve the full sensor field-of-view: scale to fit inside the
+        // negotiated output resolution and letterbox (black bars) instead of
+        // center-cropping to 16:9. The companion/driver already handles
+        // letterboxing if the virtual camera client asks for a different aspect.
+        val scale = minOf(outW.toFloat() / srcW, outH.toFloat() / srcH)
+        val scaledW = (srcW * scale).toInt().coerceAtLeast(1)
+        val scaledH = (srcH * scale).toInt().coerceAtLeast(1)
+        val x0 = (outW - scaledW) / 2
+        val y0 = (outH - scaledH) / 2
 
-        val scaled = ByteArray(outW * outH * 3 / 2)
-        yuv420ToNv21Scaled(imageProxy, scaled, x0, y0, cropW, cropH, outW, outH)
+        val tmpSize = scaledW * scaledH * 3 / 2
+        if (letterboxBuffer == null || letterboxBuffer!!.size < tmpSize) {
+            letterboxBuffer = ByteArray(tmpSize)
+        }
+        val scaled = letterboxBuffer!!
+        yuv420ToNv21Scaled(imageProxy, scaled, 0, 0, srcW, srcH, scaledW, scaledH)
+
+        val nv21 = ByteArray(outW * outH * 3 / 2)
+        // Black background for letterbox bars.
+        nv21.fill(0)
+        val uvStart = outW * outH
+        for (i in uvStart until nv21.size) nv21[i] = 0x80.toByte()
+        copyNv21(scaled, scaledW, scaledH, nv21, outW, outH, x0, y0)
+
         val tSample = System.nanoTime()
 
         if (isBeautyFilterEnabled) {
-            applyBeautyFilter(scaled, outW, outH)
+            applyBeautyFilter(nv21, outW, outH)
         }
 
-        val encoded = encoder.encode(scaled, outW, outH)
+        val encoded = encoder.encode(nv21, outW, outH)
         val tEnc = System.nanoTime()
         if (encoded != null) {
             server.sendFrame(encoded)
@@ -238,6 +251,26 @@ fun setHardwareEncoding(enabled: Boolean) {
         }
     }
 
+    /** Copy an NV21 image of size (sw x sh) into the centre of a larger
+     * (dw x dh) NV21 buffer. Both buffers use NV21 layout (YYYY... VUVU...). */
+    private fun copyNv21(
+        src: ByteArray, sw: Int, sh: Int,
+        dst: ByteArray, dw: Int, dh: Int,
+        x0: Int, y0: Int
+    ) {
+        // Y plane
+        for (y in 0 until sh) {
+            System.arraycopy(src, y * sw, dst, (y0 + y) * dw + x0, sw)
+        }
+        // UV plane (interleaved VU, one pair per 2x2 luma)
+        val srcUV = sw * sh
+        val dstUV = dw * dh
+        val uvRows = sh / 2
+        for (y in 0 until uvRows) {
+            System.arraycopy(src, srcUV + y * sw, dst, dstUV + (y0 / 2 + y) * dw + x0, sw)
+        }
+    }
+
     /** Sample YUV_420_888 planes directly into a cropped+scaled NV21 buffer.
      *
      * Nearest-neighbour sampling; handles rowStride/pixelStride padding.
@@ -260,6 +293,7 @@ fun setHardwareEncoding(enabled: Boolean) {
         val vPix = image.planes[2].pixelStride
         val dstYSize = dw * dh
 
+        try {
         if (cw == dw && ch == dh) {
             // 1:1 fast path: the crop matches the 720p target (e.g. 1280x960 ->
             // center-crop 1280x720), so bulk-copy rows instead of per-pixel
@@ -273,14 +307,14 @@ fun setHardwareEncoding(enabled: Boolean) {
             }
             val uvCw = cw / 2
             val uvStrideLen = uvCw * uPix
-            if (uRow.size < uStride) uRow = ByteArray(uStride)
-            if (vRow.size < vStride) vRow = ByteArray(uStride)
+            if (uRow.size < uvStrideLen) uRow = ByteArray(uvStrideLen)
+            if (vRow.size < uvStrideLen) vRow = ByteArray(uvStrideLen)
             for (y in 0 until dh / 2) {
                 val uvy = (y0 + 2 * y + 1) / 2
                 uBuf.position(uvy * uStride)
-                uBuf.get(uRow, 0, uvStrideLen)
+                uBuf.get(uRow, 0, minOf(uvStrideLen, uBuf.remaining()))
                 vBuf.position(uvy * vStride)
-                vBuf.get(vRow, 0, uvStrideLen)
+                vBuf.get(vRow, 0, minOf(uvStrideLen, vBuf.remaining()))
                 val drow = dstYSize + y * dw
                 for (x in 0 until dw / 2) {
                     dst[drow + x * 2] = vRow[x * vPix]
@@ -293,7 +327,7 @@ fun setHardwareEncoding(enabled: Boolean) {
         // Y plane
         if (yRow.size < yStride) yRow = ByteArray(yStride)
         for (y in 0 until dh) {
-            val sy = y0 + y * ch / dh
+            val sy = (y0 + y * ch / dh).coerceAtMost(ch - 1)
             yBuf.position(sy * yStride)
             yBuf.get(yRow, 0, cw)
             val drow = y * dw
@@ -306,21 +340,25 @@ fun setHardwareEncoding(enabled: Boolean) {
         val uvScaleY = ch.toFloat() / dh
         val uvCw = cw / 2
         val uvStrideLen = uvCw * uPix
-        if (uRow.size < uStride) uRow = ByteArray(uStride)
-        if (vRow.size < vStride) vRow = ByteArray(uStride)
+        if (uRow.size < uvStrideLen) uRow = ByteArray(uvStrideLen)
+        if (vRow.size < uvStrideLen) vRow = ByteArray(uvStrideLen)
         for (y in 0 until dh / 2) {
-            val srcY = y0 + ((y * 2 + 1) * uvScaleY).toInt()
-            val uvy = srcY / 2
+            val srcY = (y0 + ((y * 2 + 1) * uvScaleY).toInt()).coerceAtMost(ch - 1)
+            val uvy = (srcY / 2).coerceAtMost(ch / 2 - 1)
             uBuf.position(uvy * uStride)
-            uBuf.get(uRow, 0, uvStrideLen)
+            uBuf.get(uRow, 0, minOf(uvStrideLen, uBuf.remaining()))
             vBuf.position(uvy * vStride)
-            vBuf.get(vRow, 0, uvStrideLen)
+            vBuf.get(vRow, 0, minOf(uvStrideLen, vBuf.remaining()))
             val drow = dstYSize + y * dw
             for (x in 0 until dw / 2) {
-                val sx = (x0 + ((x * 2 + 1) * uvScaleX).toInt()) / 2
+                val sx = ((x0 + ((x * 2 + 1) * uvScaleX).toInt()) / 2).coerceAtMost(uvCw - 1)
                 dst[drow + x * 2] = vRow[sx * vPix]
                 dst[drow + x * 2 + 1] = uRow[sx * uPix]
             }
+        }
+        } catch (e: Exception) {
+            Log.e("CameraManager", "yuv420ToNv21Scaled dims: src=${image.width}x${image.height} cw=$cw ch=$ch dw=$dw dh=$dh yStride=$yStride uStride=$uStride vStride=$vStride uPix=$uPix vPix=$vPix uLimit=${uBuf.limit()} vLimit=${vBuf.limit()}", e)
+            throw e
         }
     }
 
@@ -548,6 +586,26 @@ fun setHardwareEncoding(enabled: Boolean) {
                     .get(CameraCharacteristics.LENS_FACING) == facing
             } catch (e: Exception) { false }
         } ?: mgr.cameraIdList.first()
+    }
+
+    /** Pick the largest supported YUV analysis size up to 1920x1440 so we
+     * keep the full sensor field-of-view regardless of the negotiated output
+     * resolution. Frames are later letterboxed to outW x outH. */
+    private fun getMaxAnalysisSize(): Size {
+        val mgr = context.getSystemService(Context.CAMERA_SERVICE)
+                as android.hardware.camera2.CameraManager
+        val chars = try { mgr.getCameraCharacteristics(camera2Id(mgr)) }
+                    catch (e: Exception) { return Size(1920, 1080) }
+        val map = chars.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
+                ?: return Size(1920, 1080)
+        val sizes = map.getOutputSizes(ImageFormat.YUV_420_888)
+                ?: return Size(1920, 1080)
+        val max = sizes
+            .filter { it.width <= 1920 && it.height <= 1440 }
+            .maxByOrNull { it.width.toLong() * it.height }
+        val result = max ?: Size(1920, 1080)
+        Log.i("CameraManager", "analysis size ${result.width}x${result.height}")
+        return result
     }
 
     private fun defaultCaps(): List<Capability> = listOf(
